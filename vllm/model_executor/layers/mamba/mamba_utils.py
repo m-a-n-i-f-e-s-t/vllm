@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import Union
 
+import math
 import torch
 
 from vllm.config import MambaDType, ModelDType
@@ -22,6 +23,20 @@ class MambaStateDtypeCalculator:
             raise ValueError("fp32 state for minimax is not yet supported")
         state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
         return (state_dtype, )
+
+    @classmethod
+    def retention_state_dtype(
+        cls,
+        model_dtype: Union[ModelDType, torch.dtype],
+        mamba_cache_dtype: MambaDType,
+        kv_cache_dtype: Union[ModelDType, torch.dtype],
+    ) -> tuple[torch.dtype, ...]:
+        if mamba_cache_dtype == "float32":
+            raise ValueError("fp32 state for retention is not yet supported")
+        state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
+        sk_dtype = torch.float32
+        cache_dtype = get_kv_cache_torch_dtype(kv_cache_dtype, model_dtype)
+        return (state_dtype, sk_dtype, cache_dtype)
 
     @classmethod
     def mamba1_state_dtype(
@@ -92,6 +107,21 @@ class MambaStateShapeCalculator:
 
         state_shape = (num_heads // tp_size, head_dim, head_dim)
         return (state_shape, )
+
+    @classmethod
+    def retention_state_shape(
+        cls,
+        num_kv_heads: int,
+        state_dim: int,
+        head_dim: int,
+        value_dim: int,
+        gating_dim: int,
+        chunk_size: int,
+    ) -> tuple[tuple[int, int, int], ...]:
+        state_shape = (num_kv_heads, state_dim, head_dim)
+        sk_shape = (num_kv_heads, state_dim)
+        cache_shape = (chunk_size, num_kv_heads, head_dim + value_dim + gating_dim)
+        return (state_shape, sk_shape, cache_shape)
 
     @classmethod
     def mamba1_state_shape(
