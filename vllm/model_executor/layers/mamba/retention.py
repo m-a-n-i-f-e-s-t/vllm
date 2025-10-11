@@ -84,8 +84,9 @@ class Retention(nn.Module, MambaBase):
         scale: float,
         p: int,
         num_kv_heads: Optional[int] = None,
-        chunk_size: Optional[int] = 1024,
+        prefill_chunk_size: Optional[int] = 1024,
         switch_over_seq_len: Optional[int] = 2048,
+        chunk_size: Optional[int] = 64,
         bias: Optional[bool] = None,
         model_config: Optional[ModelConfig] = None,
         cache_config: Optional[CacheConfig] = None,
@@ -105,6 +106,7 @@ class Retention(nn.Module, MambaBase):
         self.num_heads = num_heads
         self.head_size = head_size
         self.bias = bias
+        self.prefill_chunk_size = prefill_chunk_size
         self.chunk_size = chunk_size
         self.switch_over_seq_len = switch_over_seq_len
         # TODO(sean): enable vidrial backend
@@ -125,17 +127,17 @@ class Retention(nn.Module, MambaBase):
         # Check if chunked prefill is enabled and validate chunk size compatibility
         vllm_config = get_current_vllm_config()
         if vllm_config.scheduler_config.chunked_prefill_enabled:
-            prefill_chunk_size = vllm_config.scheduler_config.max_num_batched_tokens
+            vllm_chunk_size = vllm_config.scheduler_config.max_num_batched_tokens
             
             # Ensure retention chunk_size is a multiple of prefill chunk size
-            if prefill_chunk_size % self.chunk_size != 0:
+            if vllm_chunk_size % self.prefill_chunk_size != 0:
                 raise ValueError(
                     f"When chunked prefill is enabled, the retention layer's "
-                    f"chunk_size ({self.chunk_size}) must divide "
-                    f"max_num_batched_tokens ({prefill_chunk_size}). "
+                    f"prefill_chunk_size ({self.prefill_chunk_size}) must divide "
+                    f"max_num_batched_tokens ({vllm_chunk_size}). "
                     f"Please adjust either --max-num-batched-tokens or the model's "
                     f"chunk_size configuration. Suggested retention chunk_size values: "
-                    f"{[prefill_chunk_size * i for i in range(1, 5)]}"
+                    f"{[vllm_chunk_size * i for i in range(1, 5)]}"
                 )
 
         if envs.VLLM_USE_V1:
@@ -198,7 +200,7 @@ class Retention(nn.Module, MambaBase):
             q, k, v, log_G=g,
             initial_state=initial_state,
             sum_of_keys=initial_sk,
-            chunk_size=self.chunk_size, 
+            chunk_size=self.prefill_chunk_size, 
             deg=self.p,
             scale=self.scale,
             switch_over_seq_len=self.switch_over_seq_len, return_final_state=True)
@@ -251,8 +253,8 @@ class Retention(nn.Module, MambaBase):
             # update state and sk
             key_len = key.shape[1]
             if key_len >= self.chunk_size:
-                state_tensor[block_id].copy_(final_state.unsqueeze(0))
-                sk_tensor[block_id].copy_(final_sum_of_keys.unsqueeze(0))
+                state_tensor[block_id].copy_(final_state.squeeze(0))
+                sk_tensor[block_id].copy_(final_sum_of_keys.squeeze(0))
             
         return output
 
