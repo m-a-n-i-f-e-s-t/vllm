@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
+from multiprocessing import context
 from typing import TYPE_CHECKING, Optional, Union, Any
 
 if TYPE_CHECKING:
@@ -30,8 +31,11 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.v1.attention.backends.retention import RetentionMetadata
 
 from vllm.model_executor.models.retention_cache import RetentionCacheParams
+from vllm.utils import direct_register_custom_op
+from vllm.platforms import current_platform
 
 from retention import power_retention, power_retention_inference
+from retention._utils import compute_expanded_dim
 
 logger = init_logger(__name__)
 
@@ -109,24 +113,39 @@ class Retention(nn.Module, MambaBase):
         self.scale = scale
         self.layer_name = prefix
 
+        # Dimensions
+        self.head_dim = head_size
+        self.state_dim = compute_expanded_dim(head_size, deg=p)
+        self.gating_dim = 1
+
         assert self.p == 2, "only deg=2 is supported for now"
         assert self.chunk_size is not None, "chunk_size is required"
         assert self.switch_over_seq_len is not None, "switch_over_seq_len is required"
 
-        # Check if chunked prefill is enabled (not supported by Retention)
+        # Check if chunked prefill is enabled and validate chunk size compatibility
         vllm_config = get_current_vllm_config()
         if vllm_config.scheduler_config.chunked_prefill_enabled:
-            raise ValueError(
-                "Chunked prefill is not supported by the Retention layer. "
-                "Please disable chunked prefill by setting "
-                "--disable-chunked-prefill when launching vLLM, or ensure "
-                "--max-num-batched-tokens is large enough to avoid chunking."
-            )
+            prefill_chunk_size = vllm_config.scheduler_config.max_num_batched_tokens
+            
+            # Ensure retention chunk_size is a multiple of prefill chunk size
+            if prefill_chunk_size % self.chunk_size != 0:
+                raise ValueError(
+                    f"When chunked prefill is enabled, the retention layer's "
+                    f"chunk_size ({self.chunk_size}) must divide "
+                    f"max_num_batched_tokens ({prefill_chunk_size}). "
+                    f"Please adjust either --max-num-batched-tokens or the model's "
+                    f"chunk_size configuration. Suggested retention chunk_size values: "
+                    f"{[prefill_chunk_size * i for i in range(1, 5)]}"
+                )
+
+        if envs.VLLM_USE_V1:
+            compilation_config = get_current_vllm_config().compilation_config
+            if prefix in compilation_config.static_forward_context:
+                raise ValueError(f"Duplicate layer name: {prefix}")
+            compilation_config.static_forward_context[prefix] = self
 
 
-    def _prefill(self, query, key, gate, value, state_tensor, sk_tensor, block_idx_tensor) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[int]]:
-        forward_context: ForwardContext = get_forward_context()
-        attn_metadata = forward_context.attn_metadata
+    def _prefill(self, attn_metadata, query, key, gate, value, state_tensor, sk_tensor, block_idx_tensor) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[int]]:
 
         num_prefills = getattr(attn_metadata, "num_prefills", 0)
         assert num_prefills > 0
@@ -134,7 +153,8 @@ class Retention(nn.Module, MambaBase):
 
         max_prefill_len = 0
         qs, ks, vs, gs = [], [], [], []
-        seq_lens, block_ids = [], []
+        states, sks = [], []
+        context_lens, seq_lens, block_ids = [], [], []
         for prefill_idx in range(num_prefills):
             if prefill_idx >= len(attn_metadata.query_start_loc) or prefill_idx >= len(block_idx_tensor):
                 break
@@ -143,22 +163,32 @@ class Retention(nn.Module, MambaBase):
             q_end = attn_metadata.query_start_loc[offset + prefill_idx + 1]
             seq_len = attn_metadata.seq_lens[offset + prefill_idx]
             context_len = seq_len - (q_end - q_start)
-            if context_len > 0:
-                raise NotImplementedError("Chunked prefill is not supported by the Retention layer.")
+            context_lens.append(context_len)
             max_prefill_len = max(max_prefill_len, q_end - q_start)
             qs.append(query[q_start:q_end])
             ks.append(key[q_start:q_end])
             vs.append(value[q_start:q_end])
             gs.append(gate[q_start:q_end])
-            block_ids.append(block_idx_tensor[offset + prefill_idx])
+            block_id = block_idx_tensor[offset + prefill_idx]
+            block_ids.append(block_id)
             seq_lens.append(q_end - q_start)
+            states.append(state_tensor[block_id])
+            sks.append(sk_tensor[block_id])
 
         for i in range(len(qs)):
-            seq_len = qs[i].shape[1]
+            seq_len = qs[i].shape[0]
             qs[i] = F.pad(qs[i], (0, 0, 0, 0, 0, max_prefill_len - seq_len))
             ks[i] = F.pad(ks[i], (0, 0, 0, 0, 0, max_prefill_len - seq_len))
             vs[i] = F.pad(vs[i], (0, 0, 0, 0, 0, max_prefill_len - seq_len))
             gs[i] = F.pad(gs[i], (0, 0, 0, max_prefill_len - seq_len))
+
+        # If all context_lens are 0, the initial states are all 0
+        if all([context_len == 0 for context_len in context_lens]):
+            initial_state = None
+            initial_sk = None
+        else:
+            initial_state = torch.stack(states, dim=0) # [num_prefills, num_kv_heads, state_dim, head_dim]
+            initial_sk = torch.stack(sks, dim=0) # [num_prefills, num_kv_heads, state_dim]
 
         q = torch.stack(qs, dim=0) # [num_prefills, max_prefill_len, num_heads, head_dim]
         k = torch.stack(ks, dim=0) # [num_prefills, max_prefill_len, num_kv_heads, head_dim]
@@ -166,7 +196,8 @@ class Retention(nn.Module, MambaBase):
         g = torch.stack(gs, dim=0) # [num_prefills, max_prefill_len, num_kv_heads]
         out, final_state, final_sum_of_keys = power_retention(
             q, k, v, log_G=g,
-            initial_state=None,
+            initial_state=initial_state,
+            sum_of_keys=initial_sk,
             chunk_size=self.chunk_size, 
             deg=self.p,
             scale=self.scale,
@@ -187,9 +218,7 @@ class Retention(nn.Module, MambaBase):
 
         return output
         
-    def _decode(self, query, key_cache, value_cache, gate_cache, state_tensor, sk_tensor, block_idx_tensor) -> list[torch.Tensor]:
-        forward_context: ForwardContext = get_forward_context()
-        attn_metadata = forward_context.attn_metadata
+    def _decode(self, attn_metadata, query, key_cache, value_cache, gate_cache, state_tensor, sk_tensor, block_idx_tensor) -> list[torch.Tensor]:
         assert attn_metadata is not None
         num_decodes = getattr(attn_metadata, "num_decode_tokens", 0)
         assert num_decodes > 0
@@ -201,15 +230,16 @@ class Retention(nn.Module, MambaBase):
         
         # Because each request potentially has a different number of tokens in kv cache, we need to run a for loop.
         output = []
-        for i in range(len(num_decodes)):
+        for i in range(num_decodes):
             block_id = block_idx_tensor[i]
+            q_i = q[i].unsqueeze(0)
             key = key_cache[i].unsqueeze(0)
             value = value_cache[i].unsqueeze(0)
             gate = gate_cache[i].unsqueeze(0)
             state = state_tensor[block_id].unsqueeze(0)
             sum_of_keys = sk_tensor[block_id].unsqueeze(0)
             out, final_state, final_sum_of_keys = power_retention_inference(
-                q, key, value, log_G=gate,
+                q_i, key, value, log_G=gate,
                 initial_state=state,
                 sum_of_keys=sum_of_keys,
                 deg=self.p,
@@ -227,9 +257,8 @@ class Retention(nn.Module, MambaBase):
         return output
 
 
-    def _get_state_and_cache(self):
+    def _get_state_and_cache(self, attn_metadata):
         forward_context: ForwardContext = get_forward_context()
-        attn_metadata = forward_context.attn_metadata
 
         block_idx_tensor = attn_metadata.block_idx_tensor
         state_tensor, sk_tensor, cache_tensor = self.kv_cache[forward_context.virtual_engine]
@@ -251,9 +280,10 @@ class Retention(nn.Module, MambaBase):
         return state_tensor, sk_tensor, cache_tensor, block_idx_tensor
 
     
-    def _update_cache(self, key, gate, value, cache_tensor, block_ids) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _update_cache(self, attn_metadata, key, gate, value, cache_tensor, block_ids) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """ Retention keeps a short token cache in addition to the state and sum of keys. This function adds new tokens to the cache. Note that it may clear the cache for requests whose cache already grow past chunk_size.
         Args:
+            attn_metadata: RetentionMetadata
             key: [num_tokens, num_kv_heads, head_dim]
             gate: [num_tokens, num_kv_heads]
             value: [num_tokens, num_kv_heads, value_dim]
@@ -265,8 +295,6 @@ class Retention(nn.Module, MambaBase):
             value_cache: list of tensors of shape [value_len, num_kv_heads, value_dim]
             gate_cache: list of tensors of shape [gate_len, num_kv_heads]
         """
-        forward_context: ForwardContext = get_forward_context()
-        attn_metadata: RetentionMetadata = forward_context.attn_metadata
         assert attn_metadata is not None
 
         seq_lens = attn_metadata.seq_lens
@@ -291,7 +319,10 @@ class Retention(nn.Module, MambaBase):
             already_cached = computed_len % self.chunk_size
             if non_retained > self.chunk_size: # take out existing cache, clear and add trailing tokens
                 existing_cache = cache_tensor[block_id].narrow(0, 0, already_cached)
-                old_k, old_v, old_g = existing_cache.narrow(0, 0, head_dim), existing_cache.narrow(0, head_dim, value_dim), existing_cache.narrow(0, head_dim + value_dim, gating_dim)
+                # Split along the last dimension into k, v, g
+                old_k = existing_cache[..., :head_dim]
+                old_v = existing_cache[..., head_dim:head_dim + value_dim]
+                old_g = existing_cache[..., head_dim + value_dim:]
                 total_k = torch.cat([old_k, k], dim=0)
                 total_v = torch.cat([old_v, v], dim=0)
                 total_g = torch.cat([old_g, g], dim=0).squeeze(-1)
@@ -302,27 +333,28 @@ class Retention(nn.Module, MambaBase):
                 to_cache = non_retained % self.chunk_size
                 trailing_k = k.narrow(0, query_len - to_cache, to_cache)
                 trailing_v = v.narrow(0, query_len - to_cache, to_cache)
-                trailing_g = g.narrow(0, query_len - to_cache, to_cache).squeeze(-1)
-                pack = torch.stack([trailing_k, trailing_v, trailing_g], dim=-1)
+                trailing_g = g.narrow(0, query_len - to_cache, to_cache)
+                pack = torch.cat([trailing_k, trailing_v, trailing_g], dim=-1)
 
                 # Maybe we can save this call?
                 cache_tensor[block_id, ...] = 0
                 cache_tensor[block_id].narrow(0, 0, to_cache).copy_(pack)
 
             else: # simply append
-                pack = torch.stack([k, v, g], dim=-1) # [query_len, num_kv_heads, head_dim + value_dim + gating_dim]
+                pack = torch.cat([k, v, g], dim=-1) # [query_len, num_kv_heads, head_dim + value_dim + gating_dim]
                 assert already_cached + query_len <= self.chunk_size
                 assert already_cached + query_len == non_retained
                 cache_tensor[block_id].narrow(0, already_cached, query_len).copy_(pack)
 
-                key_cache.append(cache_tensor[block_id].narrow(0, 0, non_retained))
-                value_cache.append(cache_tensor[block_id].narrow(0, 0, non_retained))
-                gate_cache.append(cache_tensor[block_id].narrow(0, 0, non_retained))
+                cached = cache_tensor[block_id].narrow(0, 0, non_retained)
+                key_cache.append(cached[..., :head_dim])
+                value_cache.append(cached[..., head_dim:head_dim + value_dim])
+                gate_cache.append(cached[..., head_dim + value_dim:].squeeze(-1))
 
         return key_cache, value_cache, gate_cache
 
 
-    def forward(
+    def _forward_impl(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
@@ -364,7 +396,7 @@ class Retention(nn.Module, MambaBase):
         forward_context: ForwardContext = get_forward_context()
         attn_metadata = forward_context.attn_metadata
 
-        if envs.VLLM_USE_V1 and isinstance(attn_metadata, dict):
+        if envs.VLLM_USE_V1 and attn_metadata:
             attn_metadata = attn_metadata[self.layer_name]
             assert isinstance(attn_metadata, RetentionMetadata)
             num_actual_tokens = attn_metadata.num_prefill_tokens + \
@@ -376,17 +408,25 @@ class Retention(nn.Module, MambaBase):
         # check if there's new prefill, cleanup state and sk for them, add new tokens to cache
         if envs.VLLM_USE_V1:
             if attn_metadata is not None:
-                state_tensor, sk_tensor, cache_tensor, block_idx_tensor = self._get_state_and_cache()
+                state_tensor, sk_tensor, cache_tensor, block_idx_tensor = self._get_state_and_cache(attn_metadata)
+            else:
+                # Profile run: set dummy tensors (won't be used since we skip computation)
+                state_tensor = sk_tensor = cache_tensor = block_idx_tensor = None
         else:
             assert cache_params is not None
             state_tensor, sk_tensor, cache_tensor = cache_params.state_tensor, cache_params.sk_tensor, cache_params.cache_tensor
-            block_idx_tensor = cache_params.block_idx_tensor
+            block_idx_tensor = cache_params.block_indices_tensor
 
-        if attn_metadata is None: # profile run
-            return
-
-        # add new tokens to cache
-        key_cache, value_cache, gate_cache = self._update_cache(key, gate, value, cache_tensor, block_idx_tensor)
+        # For profile run (attn_metadata is None), we create dummy caches
+        # to let the full computation path execute (needed for CUDA graph capture)
+        if attn_metadata is None:
+            # Create empty lists for caches (will result in empty outputs)
+            key_cache = []
+            value_cache = []
+            gate_cache = []
+        else:
+            # add new tokens to cache
+            key_cache, value_cache, gate_cache = self._update_cache(attn_metadata, key, gate, value, cache_tensor, block_idx_tensor)
 
         num_prefills = getattr(attn_metadata, "num_prefills", 0)
         num_decodes = getattr(attn_metadata, "num_decode_tokens", 0)
@@ -394,14 +434,101 @@ class Retention(nn.Module, MambaBase):
         # take care of prefill first, here we want to find the longest prefill sequence and pad the rest to the same length
         # TODO(sean): support chunked prefill
         if num_prefills > 0:
-            outputs_prefill = self._prefill(query, key, gate, value, state_tensor, sk_tensor, block_idx_tensor)
+            outputs_prefill = self._prefill(attn_metadata, query, key, gate, value, state_tensor, sk_tensor, block_idx_tensor)
+        else:
+            outputs_prefill = []
 
         # take care of decode
         if num_decodes > 0:
-            outputs_decode = self._decode(query, key_cache, value_cache, gate_cache, state_tensor, sk_tensor, block_idx_tensor)
+            outputs_decode = self._decode(attn_metadata, query, key_cache, value_cache, gate_cache, state_tensor, sk_tensor, block_idx_tensor)
+        else:
+            outputs_decode = []
             
         # Concat outputs
-        if envs.VLLM_USE_V1:
-            output.copy_(torch.cat(outputs_decode + outputs_prefill, dim=0))
+        all_outputs = outputs_decode + outputs_prefill
+        if all_outputs:  # Only copy if we have actual outputs
+            if envs.VLLM_USE_V1:
+                output.narrow(0, 0, num_actual_tokens).copy_(torch.cat(all_outputs, dim=0))
+            else:
+                output.narrow(0, 0, num_actual_tokens).copy_(torch.cat(all_outputs, dim=0))
         else:
-            output.copy_(torch.cat(outputs_decode + outputs_prefill, dim=0))
+            # During profile run (attn_metadata=None), ensure output is deterministically written
+            # This is required for CUDA graph capture to record a consistent operation
+            output.zero_()
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        gate: torch.Tensor,
+        value: torch.Tensor,
+        output: torch.Tensor,
+        cache_params: Optional[RetentionCacheParams] = None,
+    ) -> None:
+        # For V1, delegate to custom op (ensures stable compile boundary)
+        if envs.VLLM_USE_V1:
+            torch.ops.vllm.retention(
+                query,
+                key,
+                gate,
+                value,
+                output,
+                self.layer_name,
+            )
+            return
+        # V0 path: run Python implementation directly
+        return self._forward_impl(
+            query=query,
+            key=key,
+            gate=gate,
+            value=value,
+            output=output,
+            cache_params=cache_params,
+        )
+
+
+def retention_op(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    gate: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    forward_context: ForwardContext = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+    assert isinstance(self, Retention)
+    # For V1, attn_metadata is a dict keyed by layer_name
+    attn_metadata = forward_context.attn_metadata
+    if attn_metadata is not None:
+        attn_metadata = attn_metadata[layer_name]
+    # Use v1 path (cache from forward_context)
+    self._forward_impl(
+        query=query,
+        key=key,
+        gate=gate,
+        value=value,
+        output=output,
+        cache_params=None,
+    )
+
+
+def retention_op_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    gate: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    # Fake impl used during compile; does nothing but keeps shapes
+    return
+
+
+direct_register_custom_op(
+    op_name="retention",
+    op_func=retention_op,
+    mutates_args=["output"],
+    fake_impl=retention_op_fake,
+    dispatch_key=current_platform.dispatch_key,
+)

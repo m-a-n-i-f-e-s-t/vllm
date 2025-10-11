@@ -12,26 +12,26 @@ class RetentionCacheParams:
     state_tensor: torch.Tensor = torch.Tensor()
     sk_tensor: torch.Tensor = torch.Tensor()
     cache_tensor: torch.Tensor = torch.Tensor()
-    state_indices_tensor: torch.Tensor = torch.Tensor()
+    block_indices_tensor: torch.Tensor = torch.Tensor()
 
     def at_layer_idx(self, layer_idx):
         return RetentionCacheParams(self.state_tensor[layer_idx, ...],
                                   self.sk_tensor[layer_idx, ...],
                                   self.cache_tensor[layer_idx, ...],
-                                  self.state_indices_tensor)
+                                  self.block_indices_tensor)
 
 
 class RetentionCacheManager(ConstantSizeCache):
 
     def __init__(self, dtype, state_shape, sk_shape, cache_shape):
         super().__init__(cache_shape[1])  # max_batch_size is cache_shape[1]
-        self._state_tensor = torch.empty(size=state_shape,
-                                          dtype=dtype,
-                                          device="cuda")
-        self._sk_tensor = torch.empty(size=sk_shape,
+        self._state_tensor = torch.zeros(size=state_shape,
+                                         dtype=dtype,
+                                         device="cuda")
+        self._sk_tensor = torch.zeros(size=sk_shape,
                                       dtype=torch.float32,
                                       device="cuda")
-        self._cache_tensor = torch.empty(size=cache_shape,
+        self._cache_tensor = torch.zeros(size=cache_shape,
                                          dtype=dtype,
                                          device="cuda")
 

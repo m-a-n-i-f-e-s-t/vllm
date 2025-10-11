@@ -340,6 +340,7 @@ class CompilationConfig:
         "vllm.mamba_mixer",
         "vllm.short_conv",
         "vllm.linear_attention",
+        "vllm.retention",
         "vllm.plamo2_mamba_mixer",
         "vllm.gdn_attention",
     ]

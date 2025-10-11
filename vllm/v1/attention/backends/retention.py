@@ -50,6 +50,8 @@ class RetentionMetadata:
 class RetentionMetadataBuilder(
         AttentionMetadataBuilder[RetentionMetadata]):
 
+    reorder_batch_threshold: ClassVar[int] = 1
+
     def __init__(self, kv_cache_spec: AttentionSpec, layer_names: list[str],
                  vllm_config: VllmConfig, device: torch.device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)

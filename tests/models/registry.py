@@ -317,6 +317,9 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
                                          trust_remote_code=True),
     "Plamo2ForCausalLM": _HfExamplesInfo("pfnet/plamo-2-1b",
                                         trust_remote_code=True),
+    "PowerCoderForCausalLM": _HfExamplesInfo("manifestai/powercoder-3b",
+                                             trust_remote_code=True,
+                                             max_model_len=4096),
     "QWenLMHeadModel": _HfExamplesInfo("Qwen/Qwen-7B-Chat",
                                        max_transformers_version="4.53",
                                        transformers_version_reason="HF model uses remote code that is not compatible with latest Transformers",  # noqa: E501
