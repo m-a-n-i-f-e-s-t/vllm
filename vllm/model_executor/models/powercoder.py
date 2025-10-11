@@ -19,10 +19,28 @@ https://github.com/m-a-n-i-f-e-s-t/retention
 from collections.abc import Iterable
 from typing import Optional
 
+# Global flag to control whether to use Retention or standard Attention
+# 
+# When USE_RETENTION = True:
+#   - Uses power retention mechanism for efficient long-context modeling
+#   - PowerCoderForCausalLM inherits from HasInnerState and IsAttentionFree
+#   - Maintains retention state (state_tensor, sk_tensor, cache_tensor)
+#   - Works with both V0 and V1 code paths
+#
+# When USE_RETENTION = False:
+#   - Uses standard vLLM Attention layer with KV cache
+#   - PowerCoderForCausalLM only inherits from SupportsPP (not HasInnerState/IsAttentionFree)
+#   - Compatible with all standard attention optimizations and profiling tools
+#   - Works with both V0 and V1 code paths
+#
+# To switch modes, simply change this flag and restart vLLM
+USE_RETENTION = True
+
 import torch
 from torch import nn
 
 from vllm import envs
+from vllm.attention import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.distributed.parallel_state import (
@@ -178,23 +196,35 @@ class PowerCoderAttention(nn.Module):
             is_neox_style=True,
         )
 
-        # Retention layer
-        layer_prefix = f"{prefix}.retention"
-        self.retention = Retention(
-            num_heads=self.tp_heads,
-            head_size=head_dim,
-            scale=self.scaling,
-            p=p,
-            num_kv_heads=self.tp_kv_heads,
-            chunk_size=chunk_size,
-            switch_over_seq_len=switch_over_seq_len,
-            bias=bias,
-            model_config=model_config,
-            cache_config=cache_config,
-            quant_config=quant_config,
-            layer_idx=layer_idx,
-            prefix=layer_prefix,
-        )
+        # Conditionally initialize Retention or Attention layer
+        if USE_RETENTION:
+            self.retention = Retention(
+                num_heads=self.tp_heads,
+                head_size=head_dim,
+                scale=self.scaling,
+                p=p,
+                num_kv_heads=self.tp_kv_heads,
+                chunk_size=chunk_size,
+                switch_over_seq_len=switch_over_seq_len,
+                bias=bias,
+                model_config=model_config,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                layer_idx=layer_idx,
+                prefix=f"{prefix}.retention",
+            )
+            self.attn = None
+        else:
+            self.attn = Attention(
+                self.tp_heads,
+                self.head_dim,
+                self.scaling,
+                num_kv_heads=self.tp_kv_heads,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.attn"
+            )
+            self.retention = None
 
     def forward(
         self,
@@ -202,59 +232,85 @@ class PowerCoderAttention(nn.Module):
         hidden_states: torch.Tensor,
         retention_cache_params: Optional[RetentionCacheParams] = None,
     ) -> torch.Tensor:
-        # Determine actual tokens for current step (V1) to avoid padding in capture
-        # For profile run (attn_metadata=None), use full buffer size
-        num_actual_tokens = hidden_states.shape[0]
-        if envs.VLLM_USE_V1:
-            from vllm.forward_context import get_forward_context
-            attn_metadata = get_forward_context().attn_metadata
-            if isinstance(attn_metadata, dict):
-                meta = attn_metadata.get(self.retention.layer_name, None)
-                if meta is not None:
-                    num_actual_tokens = meta.num_prefill_tokens + meta.num_decode_tokens
+        if USE_RETENTION:
+            # Retention path
+            # Determine actual tokens for current step (V1) to avoid padding in capture
+            # For profile run (attn_metadata=None), use full buffer size
+            num_actual_tokens = hidden_states.shape[0]
+            if envs.VLLM_USE_V1:
+                from vllm.forward_context import get_forward_context
+                attn_metadata_v1 = get_forward_context().attn_metadata
+                if isinstance(attn_metadata_v1, dict):
+                    meta = attn_metadata_v1.get(self.retention.layer_name, None)
+                    if meta is not None:
+                        # num_actual_tokens = meta.num_actual_tokens
+                        num_actual_tokens = meta.num_prefill_tokens + meta.num_decode_tokens
 
-        # Always slice (even if no-op) for CUDA graph compatibility
-        # During capture, num_actual_tokens == hidden_states.shape[0]
-        hidden_states = hidden_states[:num_actual_tokens]
-        positions = positions[:num_actual_tokens]
+            # Always slice (even if no-op) for CUDA graph compatibility
+            # During capture, num_actual_tokens == hidden_states.shape[0]
+            hidden_states = hidden_states[:num_actual_tokens]
+            positions = positions[:num_actual_tokens]
 
-        # Project to Q, K, V, G on the sliced tokens
-        query, _ = self.q_proj(hidden_states)
-        key, _ = self.k_proj(hidden_states)
-        value, _ = self.v_proj(hidden_states)
-        gate, _ = self.g_proj(hidden_states)
+            # Project to Q, K, V, G on the sliced tokens
+            query, _ = self.q_proj(hidden_states)
+            key, _ = self.k_proj(hidden_states)
+            value, _ = self.v_proj(hidden_states)
+            gate, _ = self.g_proj(hidden_states)
 
-        # Reshape for multi-head attention
-        # [batch * seq_len, tp_heads * head_dim] -> [batch * seq_len, tp_heads, head_dim]
-        query = query.view(-1, self.tp_heads, self.head_dim)
-        key = key.view(-1, self.tp_kv_heads, self.head_dim)
-        value = value.view(-1, self.tp_kv_heads, self.head_dim)
-        gate = gate.view(-1, self.tp_kv_heads)
+            # Reshape for multi-head attention
+            # [batch * seq_len, tp_heads * head_dim] -> [batch * seq_len, tp_heads, head_dim]
+            query = query.view(-1, self.tp_heads, self.head_dim)
+            key = key.view(-1, self.tp_kv_heads, self.head_dim)
+            value = value.view(-1, self.tp_kv_heads, self.head_dim)
+            gate = gate.view(-1, self.tp_kv_heads)
 
-        # Apply RoPE
-        query, key = self.rotary_emb(positions, query, key)
+            # Apply RoPE
+            query, key = self.rotary_emb(positions, query, key)
 
-        # Apply log-sigmoid to gate
-        gate = torch.nn.functional.logsigmoid(gate.to(torch.float32))
+            # Apply log-sigmoid to gate
+            gate = torch.nn.functional.logsigmoid(gate.to(torch.float32))
 
-        # Prepare output tensor sized to actual tokens
-        output = torch.empty_like(query)
+            # Prepare output tensor sized to actual tokens
+            output = torch.empty_like(query)
 
-        # Call retention layer (V1 path will delegate to custom op internally)
-        self.retention(
-            query=query,
-            key=key,
-            gate=gate,
-            value=value,
-            output=output,
-            cache_params=retention_cache_params,
-        )
+            # Call retention layer (V1 path will delegate to custom op internally)
+            self.retention(
+                query=query,
+                key=key,
+                gate=gate,
+                value=value,
+                output=output,
+                cache_params=retention_cache_params,
+            )
 
-        # Reshape and project output (already trimmed)
-        output2d = output.view(-1, self.tp_heads * self.head_dim)
-        output2d, _ = self.o_proj(output2d)
+            # Reshape and project output (already trimmed)
+            output2d = output.view(-1, self.tp_heads * self.head_dim)
+            output2d, _ = self.o_proj(output2d)
 
-        return output2d
+            return output2d
+        else:
+            # Standard Attention path
+            # Project to Q, K, V (no gate for standard attention)
+            query, _ = self.q_proj(hidden_states)
+            key, _ = self.k_proj(hidden_states)
+            value, _ = self.v_proj(hidden_states)
+
+            # Reshape for multi-head attention
+            query = query.view(-1, self.tp_heads, self.head_dim)
+            key = key.view(-1, self.tp_kv_heads, self.head_dim)
+            value = value.view(-1, self.tp_kv_heads, self.head_dim)
+
+            # Apply RoPE
+            query, key = self.rotary_emb(positions, query, key)
+
+            # Call standard attention (kv_cache and attn_metadata are handled internally)
+            output = self.attn(query, key, value)
+
+            # Reshape and project output
+            output2d = output.view(-1, self.tp_heads * self.head_dim)
+            output2d, _ = self.o_proj(output2d)
+
+            return output2d
 
 
 class PowerCoderDecoderLayer(nn.Module):
@@ -427,6 +483,7 @@ class PowerCoderModel(nn.Module):
         for global_idx in range(self.start_layer, self.end_layer):
             layer = self.layers[global_idx]
             layer_retention_cache_params = None
+            
             if retention_cache_params is not None:
                 layer_retention_cache_params = retention_cache_params.at_layer_idx(
                     global_idx)
@@ -450,9 +507,13 @@ class PowerCoderModel(nn.Module):
         return hidden_states
 
 
-class PowerCoderForCausalLM(nn.Module, HasInnerState, IsAttentionFree,
-                              SupportsPP):
-    """PowerCoder model with language modeling head."""
+class _PowerCoderForCausalLMBase(nn.Module):
+    """Base implementation for PowerCoder model with language modeling head.
+    
+    This base class contains all the implementation details. The actual
+    PowerCoderForCausalLM class will inherit from this plus the appropriate
+    interfaces based on whether USE_RETENTION is True or False.
+    """
 
     # PowerCoder uses separate Q, K, V, G projections (not packed)
     # No packed_modules_mapping needed
@@ -502,8 +563,8 @@ class PowerCoderForCausalLM(nn.Module, HasInnerState, IsAttentionFree,
                                                 config.vocab_size)
         self.sampler = get_sampler()
 
-        # Initialize retention cache manager for v0 path
-        if not envs.VLLM_USE_V1:
+        # Initialize retention cache manager for v0 path (only if using retention)
+        if USE_RETENTION and not envs.VLLM_USE_V1:
             num_layers = config.num_hidden_layers
             # Derive dtypes and shapes from config
             state_dtypes = self.get_mamba_state_dtype_from_config(vllm_config)
@@ -541,23 +602,28 @@ class PowerCoderForCausalLM(nn.Module, HasInnerState, IsAttentionFree,
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        kv_caches: Optional[list[torch.Tensor]] = None,
+        attn_metadata: Optional[object] = None,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        # Handle retention cache (V0 path)
+        # Handle retention cache (V0 path only when using retention)
         retention_cache_params = None
-        if not envs.VLLM_USE_V1 and self.retention_cache_manager is not None:
-            cache_tensors, state_indices_tensor = (
-                self.retention_cache_manager.current_run_tensors(**kwargs))
-            retention_cache_params = RetentionCacheParams(
-                state_tensor=cache_tensors[0],
-                sk_tensor=cache_tensors[1],
-                cache_tensor=cache_tensors[2],
-                state_indices_tensor=state_indices_tensor,
-            )
+        if USE_RETENTION:
+            if not envs.VLLM_USE_V1 and self.retention_cache_manager is not None:
+                cache_tensors, block_indices_tensor = (
+                    self.retention_cache_manager.current_run_tensors(**kwargs))
+                retention_cache_params = RetentionCacheParams(
+                    state_tensor=cache_tensors[0],
+                    sk_tensor=cache_tensors[1],
+                    cache_tensor=cache_tensors[2],
+                    block_indices_tensor=block_indices_tensor,
+                )
 
-        # V1 path: retention layer gets cache from forward_context
+        # Forward pass
+        # - Retention path: uses retention_cache_params (V0) or gets cache from forward_context (V1)
+        # - Attention path: kv_caches and attn_metadata handled internally by Attention layer
         hidden_states = self.model(
             input_ids=input_ids,
             positions=positions,
@@ -626,24 +692,32 @@ class PowerCoderForCausalLM(nn.Module, HasInnerState, IsAttentionFree,
                 
         return loaded_params
 
-    # HasInnerState implementation
+    # HasInnerState implementation (only used when USE_RETENTION is True)
     def get_mamba_type(self) -> str:
         """Return the type of mamba/inner state mechanism."""
+        if not USE_RETENTION:
+            raise NotImplementedError("get_mamba_type not supported when USE_RETENTION is False")
         return "retention"
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         """Return dtypes for (state_tensor, sk_tensor, cache_tensor)."""
+        if not USE_RETENTION:
+            raise NotImplementedError("get_state_dtype not supported when USE_RETENTION is False")
         first_layer = self.model.layers[0]
         return first_layer.self_attn.retention.get_state_dtype()
 
     def get_state_shape(self) -> tuple[tuple[int, ...], ...]:
         """Return shapes for (state_tensor, sk_tensor, cache_tensor)."""
+        if not USE_RETENTION:
+            raise NotImplementedError("get_state_shape not supported when USE_RETENTION is False")
         first_layer = self.model.layers[0]
         return first_layer.self_attn.retention.get_state_shape()
 
     @classmethod
     def get_layers_block_type(cls, vllm_config: VllmConfig):
         """All layers use retention (no hybrid attention/retention)."""
+        if not USE_RETENTION:
+            raise NotImplementedError("get_layers_block_type not supported when USE_RETENTION is False")
         config = vllm_config.model_config.hf_config
         return ["retention"] * config.num_hidden_layers
 
@@ -651,6 +725,8 @@ class PowerCoderForCausalLM(nn.Module, HasInnerState, IsAttentionFree,
     def get_mamba_state_dtype_from_config(
         cls, vllm_config: "VllmConfig"
     ) -> tuple[torch.dtype, ...]:
+        if not USE_RETENTION:
+            raise NotImplementedError("get_mamba_state_dtype_from_config not supported when USE_RETENTION is False")
         return MambaStateDtypeCalculator.retention_state_dtype(
             vllm_config.model_config.dtype,
             vllm_config.cache_config.mamba_cache_dtype,
@@ -663,6 +739,8 @@ class PowerCoderForCausalLM(nn.Module, HasInnerState, IsAttentionFree,
         vllm_config: "VllmConfig",
         use_v1: bool = True,
     ) -> tuple[tuple[int, ...], ...]:
+        if not USE_RETENTION:
+            raise NotImplementedError("get_mamba_state_shape_from_config not supported when USE_RETENTION is False")
         config = vllm_config.model_config.hf_config
         tp_size = vllm_config.parallel_config.tensor_parallel_size
         num_kv_heads = max(1, config.num_key_value_heads // tp_size)
@@ -678,6 +756,20 @@ class PowerCoderForCausalLM(nn.Module, HasInnerState, IsAttentionFree,
             gating_dim=1,
             chunk_size=chunk_size,
         )
+
+
+# Conditionally create the final PowerCoderForCausalLM class with appropriate base classes
+# When USE_RETENTION is True: inherits from HasInnerState and IsAttentionFree
+# When USE_RETENTION is False: only inherits from SupportsPP (standard attention model)
+if USE_RETENTION:
+    class PowerCoderForCausalLM(_PowerCoderForCausalLMBase, HasInnerState, 
+                                  IsAttentionFree, SupportsPP):
+        """PowerCoder model with language modeling head using Retention mechanism."""
+        pass
+else:
+    class PowerCoderForCausalLM(_PowerCoderForCausalLMBase, SupportsPP):
+        """PowerCoder model with language modeling head using standard Attention."""
+        pass
 
 
 def get_sampler():
