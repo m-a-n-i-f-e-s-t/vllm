@@ -41,6 +41,9 @@ class PowerCoderConfig(PretrainedConfig):
         residual_dropout: float = 0.0,
         embedding_dropout: float = 0.0,
         use_bias: bool = True,
+        prefill_chunk_size: int = 1024,
+        switch_over_seq_len: int = 2048,
+        chunk_size: int = 64,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -61,7 +64,9 @@ class PowerCoderConfig(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.residual_dropout = residual_dropout
         self.embedding_dropout = embedding_dropout
-
+        self.prefill_chunk_size = prefill_chunk_size
+        self.chunk_size = chunk_size
+        self.switch_over_seq_len = switch_over_seq_len
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
