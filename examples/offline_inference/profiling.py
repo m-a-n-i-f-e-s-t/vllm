@@ -44,6 +44,38 @@ def get_dtype(dtype: str):
         return dtype
 
 
+from enum import Enum
+
+
+class VLLMJSONEncoder(json.JSONEncoder):
+    """Custom JSON encoder for vLLM objects that handles enums and other types."""
+    def default(self, obj):
+        if isinstance(obj, Enum):
+            return obj.value if hasattr(obj, 'value') else str(obj)
+        if hasattr(obj, '__dict__'):
+            return str(obj)
+        try:
+            return super().default(obj)
+        except TypeError:
+            return str(obj)
+
+
+def make_serializable(obj: Any) -> Any:
+    """Recursively convert object to JSON-serializable format."""
+    if isinstance(obj, dict):
+        return {k: make_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [make_serializable(item) for item in obj]
+    elif isinstance(obj, Enum):
+        return obj.value if hasattr(obj, 'value') else str(obj)
+    elif isinstance(obj, (str, int, float, bool, type(None))):
+        return obj
+    elif hasattr(obj, '__dict__'):
+        return str(obj)
+    else:
+        return str(obj)
+
+
 OutputLen_NumReqs_Map: TypeAlias = dict[int, int]
 
 
@@ -241,7 +273,12 @@ def run_profile(
         )
         sys.exit(-1)
 
+    request_counter = [0]  # Use list to allow mutation in nested function
+    added_request_ids = []
+
     def add_requests():
+        added_request_ids.clear()
+
         def get_output_len_generator() -> Generator[int, Any, Any]:
             for output_len, num_reqs in ol_nr.items():
                 for _ in range(num_reqs):
@@ -256,15 +293,20 @@ def run_profile(
                 llm.get_tokenizer().vocab_size, size=(prompt_len,)
             ).tolist()
 
+            request_counter[0] += 1
+            request_id = f"seq{request_counter[0]}"
+            added_request_ids.append(request_id)
+
             llm.llm_engine.add_request(
-                request_id=f"seq{i}",
+                request_id=request_id,
                 prompt={"prompt_token_ids": prompt_token_ids},
                 params=sampling_params,
             )
 
     def abort_requests():
-        for i in range(batch_size):
-            llm.llm_engine.abort_request(f"seq{i}")
+        for request_id in added_request_ids:
+            llm.llm_engine.abort_request(request_id)
+        added_request_ids.clear()
 
     # Warm up run
     print("Warm up run ...")
@@ -279,9 +321,21 @@ def run_profile(
     with layerwise_profile() as prefill_prof:
         llm.llm_engine.step()  # First step is prefill
 
+    # Helper function to get num running sequences that works with both V0 and V1
+    def get_num_running_seqs():
+        if hasattr(llm.llm_engine, 'scheduler'):
+            # V0 engine
+            return llm.llm_engine.scheduler[0].get_num_unfinished_seq_groups()
+        elif hasattr(llm.llm_engine, 'get_num_unfinished_requests'):
+            # V1 engine
+            return llm.llm_engine.get_num_unfinished_requests()
+        else:
+            # Fallback: return batch_size
+            return batch_size
+
     decode_profs = []
     for _ in tqdm.tqdm(range(num_steps_to_profile - 1)):
-        num_running_seqs = llm.llm_engine.scheduler[0].get_num_unfinished_seq_groups()
+        num_running_seqs = get_num_running_seqs()
         with layerwise_profile(num_running_seqs=num_running_seqs) as decode_prof:
             llm.llm_engine.step()
         decode_profs.append(decode_prof)
@@ -351,13 +405,17 @@ def run_profile(
             for dev_idx in range(torch.cuda.device_count())
         ]
 
+        # Convert context to serializable format
+        context_dict = asdict(context)
+        serializable_context = make_serializable(context_dict)
+
         json_dict = {
             "context": {
                 "python_version": f"{sys.version}",
                 "torch_version": f"{torch.__version__}",
                 "torch_cuda_version": f"{torch.version.cuda}",
                 "cuda_devices": f"{cuda_devices}",
-                **asdict(context),
+                **serializable_context,
             },
             "prefill": prefill_results.convert_stats_to_dict(),
         }
@@ -371,7 +429,7 @@ def run_profile(
             json_output if json_output.endswith(".json") else json_output + ".json"
         )
         with open(json_output_file, "w+") as f:
-            json.dump(json_dict, f, indent=2)
+            json.dump(json_dict, f, indent=2, cls=VLLMJSONEncoder)
         pass
 
     if context.save_chrome_traces_folder is not None:
