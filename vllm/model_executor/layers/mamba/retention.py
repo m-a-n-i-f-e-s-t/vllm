@@ -84,7 +84,7 @@ class Retention(nn.Module, MambaBase):
         scale: float,
         p: int,
         num_kv_heads: Optional[int] = None,
-        prefill_chunk_size: Optional[int] = 1024,
+        prefill_chunk_size: Optional[int] = 64,
         switch_over_seq_len: Optional[int] = 2048,
         chunk_size: Optional[int] = 64,
         bias: Optional[bool] = None,
@@ -210,13 +210,14 @@ class Retention(nn.Module, MambaBase):
             output.append(out.narrow(0, i, 1).squeeze(0).narrow(0, 0, seq_lens[i]))
 
         # update state and sk
-        for prefill_idx in range(num_prefills):
-            block_id = block_ids[prefill_idx]
-            offset = attn_metadata.num_decode_tokens if envs.VLLM_USE_V1 else 0
-            seq_len = attn_metadata.seq_lens[offset + prefill_idx]
-            if seq_len >= self.chunk_size: # update state and sk
-                state_tensor.narrow(0, block_id, 1).copy_(final_state.narrow(0, prefill_idx, 1))
-                sk_tensor.narrow(0, block_id, 1).copy_(final_sum_of_keys.narrow(0, prefill_idx, 1))
+        if final_state is not None:
+            for prefill_idx in range(num_prefills):
+                block_id = block_ids[prefill_idx]
+                offset = attn_metadata.num_decode_tokens if envs.VLLM_USE_V1 else 0
+                seq_len = attn_metadata.seq_lens[offset + prefill_idx]
+                if seq_len >= self.chunk_size: # update state and sk
+                    state_tensor.narrow(0, block_id, 1).copy_(final_state.narrow(0, prefill_idx, 1))
+                    sk_tensor.narrow(0, block_id, 1).copy_(final_sum_of_keys.narrow(0, prefill_idx, 1))
 
         return output
         
@@ -229,34 +230,37 @@ class Retention(nn.Module, MambaBase):
             q = query[attn_metadata.num_prefill_tokens:].unsqueeze(1).contiguous() # [num_decodes, 1, num_heads, head_dim]
         else:
             q = query[:num_decodes].unsqueeze(1).contiguous()
-        
-        # Because each request potentially has a different number of tokens in kv cache, we need to run a for loop.
-        output = []
+
+        max_key_len = max([key.shape[0] for key in key_cache])
+        coalesced_keys = torch.zeros(num_decodes, max_key_len, self.num_kv_heads, self.head_dim, device=key_cache[0].device, dtype=key_cache[0].dtype)
+        coalesced_values = torch.zeros(num_decodes, max_key_len, self.num_kv_heads, self.head_dim, device=value_cache[0].device, dtype=value_cache[0].dtype)
+        coalesced_gates = torch.zeros(num_decodes, max_key_len, self.num_kv_heads, device=gate_cache[0].device, dtype=gate_cache[0].dtype)
+        coalesced_state = torch.zeros(num_decodes, self.num_kv_heads, self.state_dim, self.head_dim, device=state_tensor.device, dtype=state_tensor.dtype)
+        coalesced_sk = torch.zeros(num_decodes, self.num_kv_heads, self.state_dim, device=sk_tensor.device, dtype=sk_tensor.dtype)
+        for i in range(num_decodes):
+            coalesced_keys.narrow(0, i, 1).narrow(1, 0, key_cache[i].shape[0]).copy_(key_cache[i].unsqueeze(0))
+            coalesced_values.narrow(0, i, 1).narrow(1, 0, value_cache[i].shape[0]).copy_(value_cache[i].unsqueeze(0))
+            coalesced_gates.narrow(0, i, 1).narrow(1, 0, gate_cache[i].shape[0]).copy_(gate_cache[i].unsqueeze(0))
+            coalesced_state.narrow(0, i, 1).copy_(state_tensor[block_idx_tensor[i]])
+            coalesced_sk.narrow(0, i, 1).copy_(sk_tensor[block_idx_tensor[i]])
+
+        output, final_state, final_sum_of_keys = power_retention_inference(
+            q, coalesced_keys, coalesced_values, log_G=coalesced_gates,
+            initial_state=coalesced_state,
+            sum_of_keys=coalesced_sk,
+            deg=self.p,
+            scale=self.scale,
+            switch_over_seq_len=self.chunk_size)
+
+        # update state and sk
         for i in range(num_decodes):
             block_id = block_idx_tensor[i]
-            q_i = q[i].unsqueeze(0)
-            key = key_cache[i].unsqueeze(0)
-            value = value_cache[i].unsqueeze(0)
-            gate = gate_cache[i].unsqueeze(0)
-            state = state_tensor[block_id].unsqueeze(0)
-            sum_of_keys = sk_tensor[block_id].unsqueeze(0)
-            out, final_state, final_sum_of_keys = power_retention_inference(
-                q_i, key, value, log_G=gate,
-                initial_state=state,
-                sum_of_keys=sum_of_keys,
-                deg=self.p,
-                scale=self.scale,
-                # use chunk_size for switch_over_seq_len
-                switch_over_seq_len=self.chunk_size)
-            output.append(out.squeeze(0))
-
-            # update state and sk
-            key_len = key.shape[1]
+            key_len = key_cache[i].shape[0]
             if key_len >= self.chunk_size:
-                state_tensor[block_id].copy_(final_state.squeeze(0))
-                sk_tensor[block_id].copy_(final_sum_of_keys.squeeze(0))
-            
-        return output
+                state_tensor[block_id].copy_(final_state[i])
+                sk_tensor[block_id].copy_(final_sum_of_keys[i])
+    
+        return list(output.unbind(0))
 
 
     def _get_state_and_cache(self, attn_metadata):
