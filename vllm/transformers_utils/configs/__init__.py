@@ -25,6 +25,7 @@ from vllm.transformers_utils.configs.nemotron_h import NemotronHConfig
 from vllm.transformers_utils.configs.nemotron_vl import Nemotron_Nano_VL_Config
 from vllm.transformers_utils.configs.ovis import OvisConfig
 from vllm.transformers_utils.configs.powercoder import PowerCoderConfig
+from vllm.transformers_utils.configs.powen3 import Powen3Config
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
 from vllm.transformers_utils.configs.speculators.base import SpeculatorsConfig
 from vllm.transformers_utils.configs.step3_vl import (Step3TextConfig,
@@ -48,6 +49,7 @@ __all__ = [
     "Nemotron_Nano_VL_Config",
     "OvisConfig",
     "PowerCoderConfig",
+    "Powen3Config",
     "SpeculatorsConfig",
     "UltravoxConfig",
     "Step3VLConfig",

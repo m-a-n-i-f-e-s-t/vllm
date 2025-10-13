@@ -50,8 +50,8 @@ def generate_prompts(batch_size: int, prompt_length: int) -> list[str]:
         prompts.append(prompt)
     return prompts
 
-# Generate prompts with specified batch size and length
-prompts = generate_prompts(batch_size=16, prompt_length=8192)
+# Uncomment to programatically generate prompts
+# prompts = generate_prompts(batch_size=16, prompt_length=8192)
 
 # Create sampling parameters
 sampling_params = SamplingParams(
@@ -67,11 +67,7 @@ sampling_params = SamplingParams(
 llm = LLM(
     model="manifestai/powercoder-3b",
     trust_remote_code=True,
-    max_model_len=4096,
-    enforce_eager=True,
     enable_prefix_caching=False,
-    hf_overrides={'chunk_size': 32},
-    # compilation_config=dict(level=3, ),
 )
 
 # Generate completions
@@ -82,10 +78,10 @@ print("=" * 80)
 outputs = llm.generate(prompts, sampling_params)
 
 # Print results
-# for output in outputs:
-#     prompt = output.prompt
-#     generated_text = output.outputs[0].text
-#     print(f"\nPrompt: {prompt!r}")
-#     print(f"Generated: {generated_text!r}")
-#     print("-" * 80)
+for output in outputs:
+    prompt = output.prompt
+    generated_text = output.outputs[0].text
+    print(f"\nPrompt: {prompt!r}")
+    print(f"Generated: {generated_text!r}")
+    print("-" * 80)
 

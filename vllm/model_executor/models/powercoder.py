@@ -234,22 +234,6 @@ class PowerCoderAttention(nn.Module):
     ) -> torch.Tensor:
         if USE_RETENTION:
             # Retention path
-            # Determine actual tokens for current step (V1) to avoid padding in capture
-            # For profile run (attn_metadata=None), use full buffer size
-            num_actual_tokens = hidden_states.shape[0]
-            if envs.VLLM_USE_V1:
-                from vllm.forward_context import get_forward_context
-                attn_metadata_v1 = get_forward_context().attn_metadata
-                if isinstance(attn_metadata_v1, dict):
-                    meta = attn_metadata_v1.get(self.retention.layer_name, None)
-                    if meta is not None:
-                        # num_actual_tokens = meta.num_actual_tokens
-                        num_actual_tokens = meta.num_prefill_tokens + meta.num_decode_tokens
-
-            # Always slice (even if no-op) for CUDA graph compatibility
-            # During capture, num_actual_tokens == hidden_states.shape[0]
-            hidden_states = hidden_states[:num_actual_tokens]
-            positions = positions[:num_actual_tokens]
 
             # Project to Q, K, V, G on the sliced tokens
             query, _ = self.q_proj(hidden_states)

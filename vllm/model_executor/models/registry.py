@@ -130,6 +130,7 @@ _TEXT_GENERATION_MODELS = {
     "Phi4FlashForCausalLM": ("phi4flash", "Phi4FlashForCausalLM"),
     "Plamo2ForCausalLM": ("plamo2", "Plamo2ForCausalLM"),
     "PowerCoderForCausalLM": ("powercoder", "PowerCoderForCausalLM"),
+    "Powen3ForCausalLM": ("powen3", "Powen3ForCausalLM"),
     "QWenLMHeadModel": ("qwen", "QWenLMHeadModel"),
     "Qwen2ForCausalLM": ("qwen2", "Qwen2ForCausalLM"),
     "Qwen2MoeForCausalLM": ("qwen2_moe", "Qwen2MoeForCausalLM"),
