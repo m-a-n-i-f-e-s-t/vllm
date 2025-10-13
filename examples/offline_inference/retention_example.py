@@ -15,6 +15,7 @@ constraint at initialization.
 """
 
 from vllm import LLM, SamplingParams
+import os
 
 # Create prompts
 prompts = [
@@ -23,12 +24,42 @@ prompts = [
     "class BinaryTree:",
 ]
 
+# Create prompts
+def generate_prompts(batch_size: int, prompt_length: int) -> list[str]:
+    """Generate a list of random prompts.
+    
+    Args:
+        batch_size: Number of prompts to generate
+        prompt_length: Target length of each prompt in characters
+        
+    Returns:
+        List of randomly generated prompts
+    """
+    prompts = []
+    for i in range(batch_size):
+        # Generate a random function name and args
+        func_name = f"function_{i}"
+        args = f"arg_{i}"
+        
+        # Create a prompt with target length by padding with comments
+        prompt = f"def {func_name}({args}):"
+        padding_length = prompt_length - len(prompt)
+        if padding_length > 0:
+            prompt = "# " + "x" * padding_length + "\n" + prompt
+            
+        prompts.append(prompt)
+    return prompts
+
+# Generate prompts with specified batch size and length
+prompts = generate_prompts(batch_size=16, prompt_length=8192)
+
 # Create sampling parameters
 sampling_params = SamplingParams(
     temperature=0.8,
     top_p=0.95,
-    max_tokens=64,
+    max_tokens=128,
 )
+
 
 # Initialize PowerCoder model
 # Note: Retention supports chunked prefill as long as retention's chunk_size
@@ -37,8 +68,9 @@ llm = LLM(
     model="manifestai/powercoder-3b",
     trust_remote_code=True,
     max_model_len=4096,
-    # enforce_eager=True,
+    enforce_eager=True,
     enable_prefix_caching=False,
+    hf_overrides={'chunk_size': 32},
     # compilation_config=dict(level=3, ),
 )
 
@@ -50,10 +82,10 @@ print("=" * 80)
 outputs = llm.generate(prompts, sampling_params)
 
 # Print results
-for output in outputs:
-    prompt = output.prompt
-    generated_text = output.outputs[0].text
-    print(f"\nPrompt: {prompt!r}")
-    print(f"Generated: {generated_text!r}")
-    print("-" * 80)
+# for output in outputs:
+#     prompt = output.prompt
+#     generated_text = output.outputs[0].text
+#     print(f"\nPrompt: {prompt!r}")
+#     print(f"Generated: {generated_text!r}")
+#     print("-" * 80)
 

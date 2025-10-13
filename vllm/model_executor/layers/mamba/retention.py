@@ -147,23 +147,66 @@ class Retention(nn.Module, MambaBase):
             compilation_config.static_forward_context[prefix] = self
 
 
+    def _get_cpu_tensors(self, attn_metadata, block_idx_tensor=None):
+        """Extract CPU versions of metadata tensors once to avoid repeated DtoH copies.
+        
+        Returns:
+            tuple: (seq_lens_cpu, query_start_loc_cpu, block_ids_cpu)
+        """
+        # Handle seq_lens
+        if hasattr(attn_metadata, 'seq_lens_cpu'):
+            # V1 path: use pre-computed CPU tensor
+            seq_lens_cpu = attn_metadata.seq_lens_cpu
+            if not isinstance(seq_lens_cpu, (list, tuple)):
+                seq_lens_cpu = seq_lens_cpu.cpu().numpy()
+        elif hasattr(attn_metadata, 'seq_lens') and isinstance(attn_metadata.seq_lens, (list, tuple)):
+            # V0 path: seq_lens is already a Python list (CPU)
+            seq_lens_cpu = attn_metadata.seq_lens
+        else:
+            # Fallback: convert GPU tensor to CPU
+            seq_lens_cpu = attn_metadata.seq_lens.cpu().numpy()
+        
+        # Handle query_start_loc
+        if hasattr(attn_metadata, 'query_start_loc_cpu'):
+            # V1 path: use pre-computed CPU tensor
+            query_start_loc_cpu = attn_metadata.query_start_loc_cpu
+            if not isinstance(query_start_loc_cpu, (list, tuple)):
+                query_start_loc_cpu = query_start_loc_cpu.cpu().numpy()
+        else:
+            # V0 path: convert GPU tensor to CPU once
+            query_start_loc_cpu = attn_metadata.query_start_loc.cpu().numpy()
+        
+        # Handle block_idx_tensor if provided
+        block_ids_cpu = None
+        if block_idx_tensor is not None:
+            if block_idx_tensor.is_cuda:
+                block_ids_cpu = block_idx_tensor.cpu().numpy()
+            else:
+                block_ids_cpu = block_idx_tensor.numpy()
+        
+        return seq_lens_cpu, query_start_loc_cpu, block_ids_cpu
+
     def _prefill(self, attn_metadata, query, key, gate, value, state_tensor, sk_tensor, block_idx_tensor) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[int]]:
 
         num_prefills = getattr(attn_metadata, "num_prefills", 0)
         assert num_prefills > 0
         assert attn_metadata is not None
 
+        # Extract CPU versions once to avoid repeated DtoH copies
+        seq_lens_cpu, query_start_loc_cpu, block_ids_cpu = self._get_cpu_tensors(
+            attn_metadata, block_idx_tensor)
+
         max_prefill_len = 0
         qs, ks, vs, gs = [], [], [], []
         states, sks = [], []
         context_lens, seq_lens, block_ids = [], [], []
         for prefill_idx in range(num_prefills):
-            if prefill_idx >= len(attn_metadata.query_start_loc) or prefill_idx >= len(block_idx_tensor):
+            if prefill_idx >= len(query_start_loc_cpu) - 1 or prefill_idx >= len(block_ids_cpu):
                 break
             offset = attn_metadata.num_decode_tokens if envs.VLLM_USE_V1 else 0
-            q_start = attn_metadata.query_start_loc[offset + prefill_idx]
-            q_end = attn_metadata.query_start_loc[offset + prefill_idx + 1]
-            seq_len = attn_metadata.seq_lens[offset + prefill_idx]
+            q_start = int(query_start_loc_cpu[offset + prefill_idx])
+            q_end = int(query_start_loc_cpu[offset + prefill_idx + 1])
+            seq_len = int(seq_lens_cpu[offset + prefill_idx])
             context_len = seq_len - (q_end - q_start)
             context_lens.append(context_len)
             max_prefill_len = max(max_prefill_len, q_end - q_start)
@@ -171,7 +214,7 @@ class Retention(nn.Module, MambaBase):
             ks.append(key[q_start:q_end])
             vs.append(value[q_start:q_end])
             gs.append(gate[q_start:q_end])
-            block_id = block_idx_tensor[offset + prefill_idx]
+            block_id = int(block_ids_cpu[offset + prefill_idx])
             block_ids.append(block_id)
             seq_lens.append(q_end - q_start)
             states.append(state_tensor[block_id])
@@ -214,7 +257,8 @@ class Retention(nn.Module, MambaBase):
             for prefill_idx in range(num_prefills):
                 block_id = block_ids[prefill_idx]
                 offset = attn_metadata.num_decode_tokens if envs.VLLM_USE_V1 else 0
-                seq_len = attn_metadata.seq_lens[offset + prefill_idx]
+                # Use CPU version - fast access!
+                seq_len = int(seq_lens_cpu[offset + prefill_idx])
                 if seq_len >= self.chunk_size: # update state and sk
                     state_tensor.narrow(0, block_id, 1).copy_(final_state.narrow(0, prefill_idx, 1))
                     sk_tensor.narrow(0, block_id, 1).copy_(final_sum_of_keys.narrow(0, prefill_idx, 1))
@@ -231,18 +275,27 @@ class Retention(nn.Module, MambaBase):
         else:
             q = query[:num_decodes].unsqueeze(1).contiguous()
 
-        max_key_len = max([key.shape[0] for key in key_cache])
+        # Get key lengths once to avoid repeated DtoH copies when accessing .shape[0]
+        key_lens = [key.shape[0] for key in key_cache]
+        max_key_len = max(key_lens) if key_lens else 0
+        
+        # Extract CPU version of block_idx_tensor once
+        _, _, block_ids_cpu = self._get_cpu_tensors(attn_metadata, block_idx_tensor)
+        
         coalesced_keys = torch.zeros(num_decodes, max_key_len, self.num_kv_heads, self.head_dim, device=key_cache[0].device, dtype=key_cache[0].dtype)
         coalesced_values = torch.zeros(num_decodes, max_key_len, self.num_kv_heads, self.head_dim, device=value_cache[0].device, dtype=value_cache[0].dtype)
         coalesced_gates = torch.zeros(num_decodes, max_key_len, self.num_kv_heads, device=gate_cache[0].device, dtype=gate_cache[0].dtype)
         coalesced_state = torch.zeros(num_decodes, self.num_kv_heads, self.state_dim, self.head_dim, device=state_tensor.device, dtype=state_tensor.dtype)
         coalesced_sk = torch.zeros(num_decodes, self.num_kv_heads, self.state_dim, device=sk_tensor.device, dtype=sk_tensor.dtype)
         for i in range(num_decodes):
-            coalesced_keys.narrow(0, i, 1).narrow(1, 0, key_cache[i].shape[0]).copy_(key_cache[i].unsqueeze(0))
-            coalesced_values.narrow(0, i, 1).narrow(1, 0, value_cache[i].shape[0]).copy_(value_cache[i].unsqueeze(0))
-            coalesced_gates.narrow(0, i, 1).narrow(1, 0, gate_cache[i].shape[0]).copy_(gate_cache[i].unsqueeze(0))
-            coalesced_state.narrow(0, i, 1).copy_(state_tensor[block_idx_tensor[i]])
-            coalesced_sk.narrow(0, i, 1).copy_(sk_tensor[block_idx_tensor[i]])
+            key_len = key_lens[i]
+            coalesced_keys.narrow(0, i, 1).narrow(1, 0, key_len).copy_(key_cache[i].unsqueeze(0))
+            coalesced_values.narrow(0, i, 1).narrow(1, 0, key_len).copy_(value_cache[i].unsqueeze(0))
+            coalesced_gates.narrow(0, i, 1).narrow(1, 0, key_len).copy_(gate_cache[i].unsqueeze(0))
+            # Use CPU version - fast access!
+            block_id = int(block_ids_cpu[i])
+            coalesced_state.narrow(0, i, 1).copy_(state_tensor[block_id])
+            coalesced_sk.narrow(0, i, 1).copy_(sk_tensor[block_id])
 
         output, final_state, final_sum_of_keys = power_retention_inference(
             q, coalesced_keys, coalesced_values, log_G=coalesced_gates,
@@ -254,8 +307,9 @@ class Retention(nn.Module, MambaBase):
 
         # update state and sk
         for i in range(num_decodes):
-            block_id = block_idx_tensor[i]
-            key_len = key_cache[i].shape[0]
+            # Use CPU version - fast access!
+            block_id = int(block_ids_cpu[i])
+            key_len = key_lens[i]
             if key_len >= self.chunk_size:
                 state_tensor[block_id].copy_(final_state[i])
                 sk_tensor[block_id].copy_(final_sum_of_keys[i])
@@ -271,14 +325,19 @@ class Retention(nn.Module, MambaBase):
 
         num_prefills = getattr(attn_metadata, "num_prefills", 0)
         if num_prefills > 0:
+            # Extract CPU versions once
+            seq_lens_cpu, query_start_loc_cpu, block_ids_cpu = self._get_cpu_tensors(
+                attn_metadata, block_idx_tensor)
+            
             num_decode_tokens = getattr(attn_metadata, "num_decode_tokens", 0)
             for prefill_idx in range(num_prefills):
-                q_start = attn_metadata.query_start_loc[num_decode_tokens + prefill_idx]
-                q_end = attn_metadata.query_start_loc[num_decode_tokens + prefill_idx + 1]
+                # Use CPU versions - fast access!
+                q_start = int(query_start_loc_cpu[num_decode_tokens + prefill_idx])
+                q_end = int(query_start_loc_cpu[num_decode_tokens + prefill_idx + 1])
                 query_len = q_end - q_start
-                context_len = attn_metadata.seq_lens[num_decode_tokens + prefill_idx] - query_len
+                context_len = int(seq_lens_cpu[num_decode_tokens + prefill_idx]) - query_len
                 if context_len == 0:
-                    block_to_clear = block_idx_tensor[num_decode_tokens + prefill_idx]
+                    block_to_clear = int(block_ids_cpu[num_decode_tokens + prefill_idx])
                     state_tensor[block_to_clear, ...] = 0
                     sk_tensor[block_to_clear, ...] = 0
                     cache_tensor[block_to_clear, ...] = 0
@@ -303,14 +362,17 @@ class Retention(nn.Module, MambaBase):
         """
         assert attn_metadata is not None
 
-        seq_lens = attn_metadata.seq_lens
-        query_start_loc = attn_metadata.query_start_loc
+        # Extract CPU versions once to avoid repeated DtoH copies
+        seq_lens_cpu, query_start_loc_cpu, block_ids_cpu = self._get_cpu_tensors(
+            attn_metadata, block_ids)
+
         key_cache, value_cache, gate_cache = [], [], []
 
-        for i in range(len(block_ids)):
-            block_id = block_ids[i]
-            start = query_start_loc[i]
-            end = query_start_loc[i + 1]
+        for i in range(len(block_ids_cpu)):
+            # Use CPU versions - fast access!
+            block_id = int(block_ids_cpu[i])
+            start = int(query_start_loc_cpu[i])
+            end = int(query_start_loc_cpu[i + 1])
             k = key[start:end] # [query_len, num_kv_heads, head_dim]
             v = value[start:end] # [query_len, num_kv_heads, value_dim]
             g = gate[start:end].unsqueeze(-1) # [query_len, num_kv_heads, 1]
@@ -318,7 +380,7 @@ class Retention(nn.Module, MambaBase):
             value_dim = v.shape[-1]
             gating_dim = g.shape[-1]
             query_len = end - start
-            seq_len = seq_lens[i] # computed tokens + newly scheduled tokens
+            seq_len = int(seq_lens_cpu[i]) # computed tokens + newly scheduled tokens
             computed_len = seq_len - query_len
             already_retained = computed_len // self.chunk_size * self.chunk_size
             non_retained = seq_len - already_retained

@@ -29,7 +29,9 @@ class RetentionMetadata:
     num_decodes: int
     num_decode_tokens: int
     query_start_loc: torch.Tensor
+    query_start_loc_cpu: torch.Tensor
     seq_lens: torch.Tensor
+    seq_lens_cpu: torch.Tensor
 
     # Retention keeps 3 types of tensor as cache:
     # 1. state_tensor: [num_blocks, num_kv_heads, state_dim, head_dim]
@@ -63,6 +65,12 @@ class RetentionMetadataBuilder(
               fast_build: bool = False) -> RetentionMetadata:
         query_start_loc = common_attn_metadata.query_start_loc
         seq_lens = common_attn_metadata.seq_lens
+        if getattr(common_attn_metadata, "seq_lens_cpu", None) is not None:
+            query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+            seq_lens_cpu = common_attn_metadata.seq_lens_cpu
+        else:
+            query_start_loc_cpu = query_start_loc.to("cpu", non_blocking=True)
+            seq_lens_cpu = seq_lens.to("cpu", non_blocking=True)
 
         # Only one block for each request
         block_idx_tensor = common_attn_metadata.block_table_tensor[:, 0]
@@ -76,7 +84,9 @@ class RetentionMetadataBuilder(
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
             query_start_loc=query_start_loc,
+            query_start_loc_cpu=query_start_loc_cpu,
             seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
             block_idx_tensor=block_idx_tensor,
         )
         return attn_metadata

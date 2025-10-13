@@ -41,7 +41,7 @@ class PowerCoderConfig(PretrainedConfig):
         residual_dropout: float = 0.0,
         embedding_dropout: float = 0.0,
         use_bias: bool = True,
-        prefill_chunk_size: int = 1024,
+        prefill_chunk_size: int = 64,
         switch_over_seq_len: int = 2048,
         chunk_size: int = 64,
         **kwargs,
