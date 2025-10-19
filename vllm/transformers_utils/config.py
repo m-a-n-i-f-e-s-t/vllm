@@ -81,7 +81,8 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
     step3_text="Step3TextConfig",
     qwen3_next="Qwen3NextConfig",
     powercoder="PowerCoderConfig",
-    powen3="Powen3Config")
+    powen3="Powen3Config",
+    powen3_moe="Powen3MoEConfig")
 
 _CONFIG_ATTRS_MAPPING: dict[str, str] = {
     "llm_config": "text_config",
