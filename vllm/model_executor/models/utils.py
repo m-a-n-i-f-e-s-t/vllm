@@ -637,8 +637,7 @@ def make_layers(
         num_hidden_layers, get_pp_group().rank_in_group, get_pp_group().world_size
     )
     modules = torch.nn.ModuleList(
-        [PPMissingLayer() for _ in range(start_layer)]
-        + [
+        [PPMissingLayer() for _ in range(start_layer)] + [
             maybe_offload_to_cpu(layer_fn(prefix=f"{prefix}.{idx}"))
             for idx in range(start_layer, end_layer)
         ]
