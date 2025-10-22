@@ -423,17 +423,10 @@ class Powen3Model(Qwen2Model):
         # Forward through decoder layers
         for global_idx in range(self.start_layer, self.end_layer):
             layer = self.layers[global_idx]
-            layer_retention_cache_params = None
-            
-            if retention_cache_params is not None:
-                layer_retention_cache_params = retention_cache_params.at_layer_idx(
-                    global_idx)
-
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
-                retention_cache_params=layer_retention_cache_params,
             )
 
         if not get_pp_group().is_last_rank:
