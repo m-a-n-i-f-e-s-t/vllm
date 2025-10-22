@@ -11,6 +11,7 @@ from vllm.utils.torch_utils import (
     STR_DTYPE_TO_TORCH_DTYPE,
     get_kv_cache_torch_dtype,
 )
+from typing import Union
 
 
 class MambaStateDtypeCalculator:
