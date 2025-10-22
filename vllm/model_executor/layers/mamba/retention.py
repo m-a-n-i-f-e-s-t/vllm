@@ -30,7 +30,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
 from vllm.v1.attention.backends.retention import RetentionMetadata
 
-from vllm.utils import direct_register_custom_op
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.platforms import current_platform
 
 from retention import power_retention, power_retention_inference
