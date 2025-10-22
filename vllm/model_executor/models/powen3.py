@@ -530,11 +530,9 @@ class _Powen3ForCausalLMBase(nn.Module):
 
     def compute_logits(
         self,
-        hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
+        hidden_states: torch.Tensor
     ) -> Optional[torch.Tensor]:
-        logits = self.logits_processor(self.lm_head, hidden_states,
-                                       sampling_metadata)
+        logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str,
