@@ -41,8 +41,6 @@ from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.mamba.retention import Retention
-from vllm.model_executor.models.retention_cache import (RetentionCacheManager,
-                                                         RetentionCacheParams)
 from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
                                                ColumnParallelLinear,
                                                QKVParallelLinear,
@@ -293,8 +291,7 @@ class Powen3MoeRetention(nn.Module):
     def forward(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        retention_cache_params: Optional[RetentionCacheParams] = None,
+        hidden_states: torch.Tensor
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         gate, _ = self.g_proj(hidden_states)
@@ -331,8 +328,7 @@ class Powen3MoeRetention(nn.Module):
             key=k,
             gate=gate,
             value=v,
-            output=output,
-            cache_params=retention_cache_params,
+            output=output
         )
 
         # Reshape and project output

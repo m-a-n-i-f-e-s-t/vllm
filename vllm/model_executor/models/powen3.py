@@ -64,8 +64,6 @@ from vllm.model_executor.models.interfaces import (HasInnerState,
                                                    SupportsPP)
 from vllm.model_executor.models.qwen2 import Qwen2MLP as Qwen3MLP
 from vllm.model_executor.models.qwen2 import Qwen2Model
-from vllm.model_executor.models.retention_cache import (RetentionCacheManager,
-                                                         RetentionCacheParams)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
 from retention._utils import compute_expanded_dim
@@ -206,7 +204,6 @@ class Powen3Retention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        retention_cache_params: Optional[RetentionCacheParams] = None,
     ) -> torch.Tensor:
         if USE_RETENTION:
             # Retention path
@@ -260,8 +257,7 @@ class Powen3Retention(nn.Module):
                 key=k,
                 gate=gate,
                 value=v,
-                output=output,
-                cache_params=retention_cache_params,
+                output=output
             )
 
             # Reshape and project output
@@ -365,7 +361,6 @@ class Powen3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
-        retention_cache_params: Optional[RetentionCacheParams] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
@@ -377,7 +372,6 @@ class Powen3DecoderLayer(nn.Module):
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
-            retention_cache_params=retention_cache_params,
         )
 
         # Fully Connected
@@ -412,7 +406,6 @@ class Powen3Model(Qwen2Model):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        retention_cache_params: Optional[RetentionCacheParams] = None,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -519,40 +512,6 @@ class _Powen3ForCausalLMBase(nn.Module):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
 
-        # Initialize retention cache manager for v0 path (only if using retention)
-        if USE_RETENTION and not envs.VLLM_USE_V1:
-            num_layers = config.num_hidden_layers
-            # Derive dtypes and shapes from config
-            state_dtypes = self.get_mamba_state_dtype_from_config(vllm_config)
-            state_shapes = self.get_mamba_state_shape_from_config(
-                vllm_config, use_v1=False)
-
-            max_batch_size = vllm_config.scheduler_config.max_num_seqs
-            if not vllm_config.model_config.enforce_eager:
-                max_batch_size = vllm_config.pad_for_cudagraph(max_batch_size)
-
-            state_shape = (num_layers, max_batch_size, *state_shapes[0])
-            sk_shape = (num_layers, max_batch_size, *state_shapes[1])
-            cache_shape = (num_layers, max_batch_size, *state_shapes[2])
-
-            self.retention_cache_manager = RetentionCacheManager(
-                dtype=state_dtypes[0],
-                state_shape=state_shape,
-                sk_shape=sk_shape,
-                cache_shape=cache_shape,
-            )
-        else:
-            self.retention_cache_manager = None
-
-    def copy_inputs_before_cuda_graphs(self, input_buffers, **kwargs):
-        if self.retention_cache_manager:
-            return self.retention_cache_manager.copy_inputs_before_cuda_graphs(
-                input_buffers, **kwargs)
-
-    def get_seqlen_agnostic_capture_inputs(self, batch_size: int):
-        if self.retention_cache_manager:
-            return self.retention_cache_manager.get_seqlen_agnostic_capture_inputs(
-                batch_size)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
@@ -567,24 +526,10 @@ class _Powen3ForCausalLMBase(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        # Handle retention cache (V0 path only when using retention)
-        retention_cache_params = None
-        if USE_RETENTION:
-            if not envs.VLLM_USE_V1 and self.retention_cache_manager is not None:
-                cache_tensors, block_indices_tensor = (
-                    self.retention_cache_manager.current_run_tensors(**kwargs))
-                retention_cache_params = RetentionCacheParams(
-                    state_tensor=cache_tensors[0],
-                    sk_tensor=cache_tensors[1],
-                    cache_tensor=cache_tensors[2],
-                    block_indices_tensor=block_indices_tensor,
-                )
-
         # Forward pass
         hidden_states = self.model(
             input_ids=input_ids,
             positions=positions,
-            retention_cache_params=retention_cache_params,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
         )

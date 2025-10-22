@@ -30,7 +30,6 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
 from vllm.v1.attention.backends.retention import RetentionMetadata
 
-from vllm.model_executor.models.retention_cache import RetentionCacheParams
 from vllm.utils import direct_register_custom_op
 from vllm.platforms import current_platform
 
@@ -428,8 +427,7 @@ class Retention(nn.Module, MambaBase):
         key: torch.Tensor,
         gate: torch.Tensor,
         value: torch.Tensor,
-        output: torch.Tensor,
-        cache_params: Optional[RetentionCacheParams] = None,
+        output: torch.Tensor
     ) -> None:
         """ 
         Relevant tensor objects:
@@ -439,11 +437,6 @@ class Retention(nn.Module, MambaBase):
         gate:  [num_tokens, num_kv_heads]
         value: [num_tokens, num_kv_heads, value_dim]
         output: [num_tokens, num_heads, value_dim]
-
-        cache_params: RetentionCacheParams (only available for v0 path) containing:
-            state_tensor: [num_blocks, *state_shape]
-            sk_tensor: [num_blocks, *sk_shape]
-            cache_tensor: [num_blocks, *cache_shape]
 
         self.kv_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor] (only available for v1 path)
             state_tensor: [num_blocks, *state_shape]
@@ -474,16 +467,11 @@ class Retention(nn.Module, MambaBase):
             assert query.shape[0] == key.shape[0] == gate.shape[0] == value.shape[0], "batch size should match for profile run or first prefill"
 
         # check if there's new prefill, cleanup state and sk for them, add new tokens to cache
-        if envs.VLLM_USE_V1:
-            if attn_metadata is not None:
-                state_tensor, sk_tensor, cache_tensor, block_idx_tensor = self._get_state_and_cache(attn_metadata)
-            else:
-                # Profile run: set dummy tensors (won't be used since we skip computation)
-                state_tensor = sk_tensor = cache_tensor = block_idx_tensor = None
+        if attn_metadata is not None:
+            state_tensor, sk_tensor, cache_tensor, block_idx_tensor = self._get_state_and_cache(attn_metadata)
         else:
-            assert cache_params is not None
-            state_tensor, sk_tensor, cache_tensor = cache_params.state_tensor, cache_params.sk_tensor, cache_params.cache_tensor
-            block_idx_tensor = cache_params.block_indices_tensor
+            # Profile run: set dummy tensors (won't be used since we skip computation)
+            state_tensor = sk_tensor = cache_tensor = block_idx_tensor = None
 
         # For profile run (attn_metadata is None), we create dummy caches
         # to let the full computation path execute (needed for CUDA graph capture)
@@ -530,28 +518,15 @@ class Retention(nn.Module, MambaBase):
         key: torch.Tensor,
         gate: torch.Tensor,
         value: torch.Tensor,
-        output: torch.Tensor,
-        cache_params: Optional[RetentionCacheParams] = None,
+        output: torch.Tensor
     ) -> None:
-        # For V1, delegate to custom op (ensures stable compile boundary)
-        if envs.VLLM_USE_V1:
-            torch.ops.vllm.retention(
-                query,
-                key,
-                gate,
-                value,
-                output,
-                self.layer_name,
-            )
-            return
-        # V0 path: run Python implementation directly
-        return self._forward_impl(
-            query=query,
-            key=key,
-            gate=gate,
-            value=value,
-            output=output,
-            cache_params=cache_params,
+        torch.ops.vllm.retention(
+            query,
+            key,
+            gate,
+            value,
+            output,
+            self.layer_name,
         )
 
 
@@ -576,8 +551,7 @@ def retention_op(
         key=key,
         gate=gate,
         value=value,
-        output=output,
-        cache_params=None,
+        output=output
     )
 
 

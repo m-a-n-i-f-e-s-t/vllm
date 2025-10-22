@@ -63,8 +63,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import (HasInnerState,
                                                    IsAttentionFree, SupportsPP)
-from vllm.model_executor.models.retention_cache import (RetentionCacheManager,
-                                                         RetentionCacheParams)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
 
@@ -229,8 +227,7 @@ class PowerCoderAttention(nn.Module):
     def forward(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        retention_cache_params: Optional[RetentionCacheParams] = None,
+        hidden_states: torch.Tensor
     ) -> torch.Tensor:
         if USE_RETENTION:
             # Retention path
@@ -263,8 +260,7 @@ class PowerCoderAttention(nn.Module):
                 key=key,
                 gate=gate,
                 value=value,
-                output=output,
-                cache_params=retention_cache_params,
+                output=output
             )
 
             # Reshape and project output (already trimmed)
@@ -357,7 +353,6 @@ class PowerCoderDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
-        retention_cache_params: Optional[RetentionCacheParams] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self-attention with pre-norm
         if residual is None:
@@ -371,8 +366,7 @@ class PowerCoderDecoderLayer(nn.Module):
 
         hidden_states = self.self_attn(
             positions=positions,
-            hidden_states=hidden_states,
-            retention_cache_params=retention_cache_params,
+            hidden_states=hidden_states
         )
 
         # MLP with pre-norm
@@ -448,7 +442,6 @@ class PowerCoderModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        retention_cache_params: Optional[RetentionCacheParams] = None,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -466,17 +459,10 @@ class PowerCoderModel(nn.Module):
         # Forward through decoder layers
         for global_idx in range(self.start_layer, self.end_layer):
             layer = self.layers[global_idx]
-            layer_retention_cache_params = None
-            
-            if retention_cache_params is not None:
-                layer_retention_cache_params = retention_cache_params.at_layer_idx(
-                    global_idx)
-
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
-                retention_cache_params=layer_retention_cache_params,
             )
 
         if not get_pp_group().is_last_rank:
@@ -592,26 +578,9 @@ class _PowerCoderForCausalLMBase(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        # Handle retention cache (V0 path only when using retention)
-        retention_cache_params = None
-        if USE_RETENTION:
-            if not envs.VLLM_USE_V1 and self.retention_cache_manager is not None:
-                cache_tensors, block_indices_tensor = (
-                    self.retention_cache_manager.current_run_tensors(**kwargs))
-                retention_cache_params = RetentionCacheParams(
-                    state_tensor=cache_tensors[0],
-                    sk_tensor=cache_tensors[1],
-                    cache_tensor=cache_tensors[2],
-                    block_indices_tensor=block_indices_tensor,
-                )
-
-        # Forward pass
-        # - Retention path: uses retention_cache_params (V0) or gets cache from forward_context (V1)
-        # - Attention path: kv_caches and attn_metadata handled internally by Attention layer
         hidden_states = self.model(
             input_ids=input_ids,
             positions=positions,
-            retention_cache_params=retention_cache_params,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
         )
