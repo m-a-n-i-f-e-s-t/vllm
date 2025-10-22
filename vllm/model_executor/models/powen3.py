@@ -64,7 +64,7 @@ from vllm.model_executor.models.interfaces import (HasInnerState,
                                                    SupportsPP)
 from vllm.model_executor.models.qwen2 import Qwen2MLP as Qwen3MLP
 from vllm.model_executor.models.qwen2 import Qwen2Model
-from vllm.model_executor.sampling_metadata import SamplingMetadata
+from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
 from retention._utils import compute_expanded_dim
 
