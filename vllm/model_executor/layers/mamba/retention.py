@@ -12,9 +12,7 @@ if TYPE_CHECKING:
 from typing import TYPE_CHECKING
 
 import torch
-import torch.nn.functional as F
-from einops import rearrange
-from torch import nn
+from transformers.configuration_utils import PretrainedConfig
 
 from vllm.attention import AttentionMetadata
 from vllm.config import CacheConfig, ModelConfig, get_current_vllm_config
@@ -36,11 +34,11 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.mamba.ops.retention import power_retention_varlen
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.retention import RetentionMetadata
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 from vllm.config import VllmConfig
-from vllm.model_executor.layers.mamba.ops.retention import power_retention_varlen
 
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionBackend
@@ -55,8 +53,9 @@ class Retention(MambaBase, CustomOp):
         head_dim: int,
         scale: float,
         num_kv_heads: int | None = None,
-        model_config: ModelConfig | None = None,
+        config: PretrainedConfig | None = None,
         cache_config: CacheConfig | None = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         layer_idx: int = 0,
     ):
@@ -65,16 +64,22 @@ class Retention(MambaBase, CustomOp):
         self.head_dim = head_dim
         self.scale = scale
         self.num_kv_heads = num_kv_heads or num_heads
-        self.model_config = model_config
+        self.config = config
         self.cache_config = cache_config
+        self.quant_config = quant_config
         self.prefix = prefix
         self.layer_idx = layer_idx
-        self.chunk_size = self.cache_config.mamba_chunk_size
+        self.chunk_size = self.cache_config.mamba_block_size
 
-        hf_config = self.model_config.hf_config.to_dict()
-        self.d_tile = hf_config.get("d_tile", 16)
-        self.power = hf_config.get("power", 2)
+        self.d_tile = config.to_dict().get("d_tile", 16)
+        self.power = config.to_dict().get("p", 2)
         self.state_dim = self.sympow_dim(self.head_dim, self.power, self.d_tile)
+
+        compilation_config = get_current_vllm_config().compilation_config
+        if prefix in compilation_config.static_forward_context:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        compilation_config.static_forward_context[prefix] = self
+        self.kv_cache = (torch.tensor([]),) * 5  # 5 caches: memory, ks, k_cache, v_cache, g_cache
 
     @property
     def mamba_type(self) -> str:
@@ -86,26 +91,22 @@ class Retention(MambaBase, CustomOp):
             return math.comb(d + power - 1, power)
         return cls.sympow_dim(d // d_tile, power) * d_tile**power
 
-    def get_atnn_backend(self) -> type["AttentionBackend"]:
+    def get_attn_backend(self) -> type["AttentionBackend"]:
         from vllm.v1.attention.backends.retention import RetentionBackend
 
         return RetentionBackend
     
-    def get_state_type(self) -> tuple[torch.dtype]:
-        assert self.model_config is not None
+    def get_state_dtype(self) -> tuple[torch.dtype]:
+        assert self.config is not None
         assert self.cache_config is not None
         return MambaStateDtypeCalculator.retention_state_dtype(
-            self.model_config.dtype,
+            self.config.torch_dtype,
             self.cache_config.mamba_cache_dtype,
         )
 
     def get_state_shape(self) -> tuple[tuple[int, ...]]:
-        assert self.model_config is not None
-        assert self.cache_config is not None
-        
         return MambaStateShapeCalculator.retention_state_shape(
             num_heads=self.num_heads,
-            tp_size=self.tp_size,
             head_dim=self.head_dim,
             state_dim=self.state_dim,
             chunk_size=self.chunk_size,
@@ -127,6 +128,7 @@ class Retention(MambaBase, CustomOp):
             output,
             self.prefix,
         )
+        return output
 
     def forward_cuda(
         self,
@@ -200,7 +202,7 @@ def retention(
     gate: torch.Tensor,
     output: torch.Tensor,
     layer_name: str,
-):
+) -> None:
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
     self.forward_cuda(query=query, key=key, value=value, gate=gate, output=output)
@@ -213,7 +215,7 @@ def retention_fake(
     gate: torch.Tensor,
     output: torch.Tensor,
     layer_name: str,
-):
+) -> None:
     return
 
 

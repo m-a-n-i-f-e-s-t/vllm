@@ -292,10 +292,6 @@ class MambaModelConfig(VerifyAndUpdateConfig):
 
         if cache_config.enable_prefix_caching:
             if model_config.supports_mamba_prefix_caching:
-                # With prefix caching on pure MambaModel, the block size is set to
-                # the chunk size to optimize for prefix caching.
-                chunk_size = cache_config.mamba_block_size or model_config.get_mamba_chunk_size()
-                cache_config.mamba_block_size = chunk_size
                 logger.info(
                     "Warning: Prefix caching is currently enabled. "
                     "Its support for Mamba layers is experimental. "
@@ -311,6 +307,44 @@ class MambaModelConfig(VerifyAndUpdateConfig):
         # TODO(tdoublep): remove once cascade attention is supported
         logger.info(
             "Disabling cascade attention since it is not supported for hybrid models."
+        )
+        model_config.disable_cascade_attn = True
+
+
+class RetentionModelConfig(VerifyAndUpdateConfig):
+    @classmethod
+    def verify_and_update_config(cls, vllm_config: "VllmConfig") -> None:
+        """
+        Enable FULL_AND_PIECEWISE cuda graph mode by default (required
+        to get good performance for retention layers in V1).
+
+        Args:
+            vllm_config: vLLM Config
+        """
+        model_config = vllm_config.model_config
+        cache_config = vllm_config.cache_config
+
+        if cache_config.enable_prefix_caching:
+            if model_config.supports_mamba_prefix_caching:
+                # With prefix caching on pure MambaModel, the block size is set to
+                # the chunk size to optimize for prefix caching.
+                chunk_size = cache_config.mamba_block_size or model_config.get_mamba_chunk_size()
+                cache_config.mamba_block_size = chunk_size
+                logger.info(
+                    "Warning: Prefix caching is currently enabled. "
+                    "Its support for Mamba layers is experimental. "
+                    "Please report any issues you may observe."
+                )
+            else:
+                logger.info(
+                    "Hybrid or mamba-based model detected without "
+                    "support for prefix caching: disabling."
+                )
+                cache_config.enable_prefix_caching = False
+                cache_config.mamba_block_size = model_config.max_model_len
+
+        logger.info(
+            "Disabling cascade attention since it is not supported for retention models."
         )
         model_config.disable_cascade_attn = True
         if cache_config.block_size is None or cache_config.block_size != cache_config.mamba_block_size:
@@ -505,7 +539,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "GptOssForCausalLM": GptOssForCausalLMConfig,
     "MambaForCausalLM": MambaModelConfig,
     "Mamba2ForCausalLM": MambaModelConfig,
-    "BrumbyForCausalLM": MambaModelConfig,
     "FalconMambaForCausalLM": MambaModelConfig,
     "DeepseekV32ForCausalLM": DeepseekV32ForCausalLM,
+    "BrumbyForCausalLM": RetentionModelConfig,
 }

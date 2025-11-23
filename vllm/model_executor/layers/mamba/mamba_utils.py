@@ -105,15 +105,14 @@ class MambaStateShapeCalculator:
     def retention_state_shape(
         cls,
         num_heads: int,
-        tp_size: int,
         head_dim: int,
         state_dim: int,
         chunk_size: int,
     ) -> tuple[tuple[int, int, int], ...]:
-        state_shape = (num_heads // tp_size, state_dim, head_dim)
-        sk_shape = (num_heads // tp_size, state_dim)
-        cache_shape = (num_heads // tp_size, chunk_size, head_dim)
-        gate_shape = (num_heads // tp_size, chunk_size)
+        state_shape = (num_heads, state_dim, head_dim)
+        sk_shape = (num_heads, state_dim)
+        cache_shape = (num_heads, chunk_size, head_dim)
+        gate_shape = (num_heads, chunk_size)
         return (state_shape, sk_shape, cache_shape, cache_shape, gate_shape)
 
     @classmethod

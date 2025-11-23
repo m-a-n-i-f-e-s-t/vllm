@@ -38,6 +38,7 @@ from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.mamba.retention import Retention
+from vllm.model_executor.models.interfaces import SupportsMambaPrefixCaching, HasInnerState, IsAttentionFree
 from vllm.model_executor.layers.linear import ColumnParallelLinear, QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -65,7 +66,7 @@ class BrumbyRetention(nn.Module):
         rms_norm_eps: float = 1e-06,
         qkv_bias: bool = False,
         rope_theta: float = 10000,
-        model_config: ModelConfig | None = None,
+        config: BrumbyConfig | None = None,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         rope_scaling: tuple | None = None,
@@ -129,7 +130,7 @@ class BrumbyRetention(nn.Module):
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
-            model_config=model_config,
+            config=config,
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
@@ -183,6 +184,7 @@ class BrumbyDecoderLayer(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             qkv_bias=getattr(config, "attention_bias", False),
             head_dim=getattr(config, "head_dim", None),
+            config=config,
             cache_config=cache_config,
             quant_config=quant_config,
             rope_scaling=rope_scaling,
@@ -245,7 +247,7 @@ class BrumbyModel(Qwen2Model):
         )
 
 
-class BrumbyForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
+class BrumbyForCausalLM(nn.Module, SupportsMambaPrefixCaching, HasInnerState, IsAttentionFree):
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -255,6 +257,9 @@ class BrumbyForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         "gate_up_proj": [
             "gate_proj",
             "up_proj",
+        ],
+        "g_proj": [
+            "g_proj",
         ],
     }
 
