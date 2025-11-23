@@ -1467,7 +1467,7 @@ class ModelConfig:
         # used by e.g. Bamba, FalconH1, Granite, PLaMo2
         chunk_size = getattr(self.hf_text_config, "mamba_chunk_size", None)
         if chunk_size is None:
-            # used by e.g. Mamba2, NemotronH, Zamba
+            # used by e.g. Mamba2, NemotronH, Zamba, Brumby
             chunk_size = getattr(self.hf_text_config, "chunk_size", None)
 
         # Since Mamba1 does not have a chunk notion

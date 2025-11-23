@@ -4,6 +4,8 @@
 import math
 from typing import TYPE_CHECKING
 
+from vllm.v1.attention.backends.retention import RetentionMetadata
+
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionBackend
 
@@ -35,15 +37,45 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.utils.torch_utils import direct_register_custom_op
-from vllm.v1.attention.backends.linear_attn import LinearAttentionMetadata
+from vllm.v1.attention.backends.retention import RetentionMetadata
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 from vllm.config import VllmConfig
+from vllm.model_executor.layers.mamba.ops.retention import power_retention_varlen
 
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionBackend
 
 
-class Retention(nn.Module, MambaBase):
+@CustomOp.register("retention")
+class Retention(MambaBase, CustomOp):
+    
+    def __init__(
+        self,
+        num_heads: int,
+        head_dim: int,
+        scale: float,
+        num_kv_heads: int | None = None,
+        model_config: ModelConfig | None = None,
+        cache_config: CacheConfig | None = None,
+        prefix: str = "",
+        layer_idx: int = 0,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.scale = scale
+        self.num_kv_heads = num_kv_heads or num_heads
+        self.model_config = model_config
+        self.cache_config = cache_config
+        self.prefix = prefix
+        self.layer_idx = layer_idx
+        self.chunk_size = self.cache_config.mamba_chunk_size
+
+        hf_config = self.model_config.hf_config.to_dict()
+        self.d_tile = hf_config.get("d_tile", 16)
+        self.power = hf_config.get("power", 2)
+        self.state_dim = self.sympow_dim(self.head_dim, self.power, self.d_tile)
+
     @property
     def mamba_type(self) -> str:
         return "retention"
@@ -55,9 +87,9 @@ class Retention(nn.Module, MambaBase):
         return cls.sympow_dim(d // d_tile, power) * d_tile**power
 
     def get_atnn_backend(self) -> type["AttentionBackend"]:
-        from vllm.v1.attention.backends.retention_attn import RetentionAttentionBackend
+        from vllm.v1.attention.backends.retention import RetentionBackend
 
-        return RetentionAttentionBackend
+        return RetentionBackend
     
     def get_state_type(self) -> tuple[torch.dtype]:
         assert self.model_config is not None
@@ -69,13 +101,125 @@ class Retention(nn.Module, MambaBase):
 
     def get_state_shape(self) -> tuple[tuple[int, ...]]:
         assert self.model_config is not None
-        hf_config = self.model_config.hf_config.to_dict()
-        d_tile = hf_config.get("d_tile", 16)
-        power = hf_config.get("power", 2)
-        state_dim = self.sympow_dim(self.head_dim, power, d_tile)
+        assert self.cache_config is not None
+        
         return MambaStateShapeCalculator.retention_state_shape(
             num_heads=self.num_heads,
             tp_size=self.tp_size,
             head_dim=self.head_dim,
-            state_dim=state_dim,
+            state_dim=self.state_dim,
+            chunk_size=self.chunk_size,
         )
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        gate: torch.Tensor
+    ):
+        output = torch.empty_like(query)
+        torch.ops.vllm.retention(
+            query,
+            key,
+            value,
+            gate,
+            output,
+            self.prefix,
+        )
+
+    def forward_cuda(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        gate: torch.Tensor,
+        output: torch.Tensor,
+    ):
+        forward_context: ForwardContext = get_forward_context()
+        attn_metadata: AttentionMetadata = forward_context.attn_metadata
+
+        assert self.cache_config is not None
+        mamba_block_size = self.cache_config.mamba_block_size
+        prefix_caching_enabled = self.cache_config.enable_prefix_caching
+
+        if attn_metadata is not None:
+            assert isinstance(attn_metadata, dict)
+            attn_metadata = attn_metadata[self.prefix]
+            assert isinstance(attn_metadata, RetentionMetadata)
+            self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+
+            memory = self_kv_cache[0]
+            ks = self_kv_cache[1]
+            k_cache = self_kv_cache[2]
+            v_cache = self_kv_cache[3]
+            g_cache = self_kv_cache[4]
+            block_table = attn_metadata.block_table
+            cu_seqlens_q = attn_metadata.cu_seqlens_q
+            cu_seqlens_padded_q = attn_metadata.cu_seqlens_padded_q
+            seq_lens = attn_metadata.seq_lens
+            cache_lens = attn_metadata.cache_lens
+            cu_cache_lens = attn_metadata.cu_cache_lens
+            last_memorized_blk_idx = attn_metadata.last_memorized_blk_idx
+        
+        else: # profile run
+            return output
+
+        
+        # Call kernel
+        power_retention_varlen(
+            output,
+            query,
+            key,
+            value,
+            gate,
+            memory,
+            ks,
+            k_cache,
+            v_cache,
+            g_cache,
+            block_table,
+            cu_seqlens_q,
+            seq_lens,
+            cache_lens,
+            cu_cache_lens,
+            last_memorized_blk_idx,
+            cu_seqlens_padded_q,
+            self.scale,
+            self.chunk_size,
+            self.d_tile,
+            self.power,
+        )
+        
+
+
+def retention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+):
+    forward_context: ForwardContext = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+    self.forward_cuda(query=query, key=key, value=value, gate=gate, output=output)
+
+
+def retention_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+):
+    return
+
+
+direct_register_custom_op(
+    op_name="retention",
+    op_func=retention,
+    mutates_args=["output"],
+    fake_impl=retention_fake,
+)
