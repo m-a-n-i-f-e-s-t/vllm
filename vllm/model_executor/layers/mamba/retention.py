@@ -89,7 +89,7 @@ class Retention(MambaBase, CustomOp):
     def sympow_dim(cls, d, power, d_tile=1):
         if d_tile == 1:
             return math.comb(d + power - 1, power)
-        return cls.sympow_dim(d // d_tile, power) * d_tile**power
+        return cls.sympow_dim(d // d_tile, power) * (d_tile**power)
 
     def get_attn_backend(self) -> type["AttentionBackend"]:
         from vllm.v1.attention.backends.retention import RetentionBackend
@@ -167,6 +167,10 @@ class Retention(MambaBase, CustomOp):
         else: # profile run
             return output
 
+        query = query.view(-1, self.num_heads, self.head_dim)
+        key = key.view(-1, self.num_kv_heads, self.head_dim)
+        value = value.view(-1, self.num_kv_heads, self.head_dim)
+        gate = gate.view(-1, self.num_kv_heads)
         
         # Call kernel
         power_retention_varlen(
