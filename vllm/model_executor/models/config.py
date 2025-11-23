@@ -505,6 +505,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "GptOssForCausalLM": GptOssForCausalLMConfig,
     "MambaForCausalLM": MambaModelConfig,
     "Mamba2ForCausalLM": MambaModelConfig,
+    "BrumbyForCausalLM": MambaModelConfig,
     "FalconMambaForCausalLM": MambaModelConfig,
     "DeepseekV32ForCausalLM": DeepseekV32ForCausalLM,
 }
