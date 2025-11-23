@@ -38,6 +38,7 @@ from vllm.transformers_utils.configs.step3_vl import (
     Step3VLConfig,
 )
 from vllm.transformers_utils.configs.ultravox import UltravoxConfig
+from vllm.transformers_utils.configs.brumby import BrumbyConfig
 
 __all__ = [
     "ChatGLMConfig",
@@ -65,4 +66,5 @@ __all__ = [
     "Step3VisionEncoderConfig",
     "Step3TextConfig",
     "Qwen3NextConfig",
+    "BrumbyConfig",
 ]

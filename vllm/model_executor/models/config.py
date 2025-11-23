@@ -292,6 +292,10 @@ class MambaModelConfig(VerifyAndUpdateConfig):
 
         if cache_config.enable_prefix_caching:
             if model_config.supports_mamba_prefix_caching:
+                # With prefix caching on pure MambaModel, the block size is set to
+                # the chunk size to optimize for prefix caching.
+                chunk_size = cache_config.mamba_block_size or model_config.get_mamba_chunk_size()
+                cache_config.mamba_block_size = chunk_size
                 logger.info(
                     "Warning: Prefix caching is currently enabled. "
                     "Its support for Mamba layers is experimental. "
@@ -309,6 +313,9 @@ class MambaModelConfig(VerifyAndUpdateConfig):
             "Disabling cascade attention since it is not supported for hybrid models."
         )
         model_config.disable_cascade_attn = True
+        if cache_config.block_size is None or cache_config.block_size != cache_config.mamba_block_size:
+            cache_config.block_size = cache_config.mamba_block_size
+            logger.info("Setting cache block size to %d tokens to match mamba block size", cache_config.mamba_block_size)
 
 
 class HybridAttentionMambaModelConfig(VerifyAndUpdateConfig):
