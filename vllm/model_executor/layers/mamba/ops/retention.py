@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 import itertools
 import math
-
+from functools import lru_cache
 
 @triton.jit
 def binom(n: tl.constexpr, k: tl.constexpr):
@@ -172,7 +172,7 @@ def localize_this_pid_in_chunk(
     local_block_idx = query_block_idx % (chunk_size // BLOCK_SIZE)
 
     # get cache length
-    cache_len = tl.load(cache_lens_ptr + seq_idx)
+    cache_len = (tl.load(cache_lens_ptr + seq_idx)).to(tl.int32)
     if chunk_idx == 0:
         chunk_cache_len = cache_len
     else:
@@ -180,9 +180,9 @@ def localize_this_pid_in_chunk(
     
     # get scheduled length
     query_token_offset = tl.load(cu_seqlens_q_ptr + seq_idx)
-    query_len = tl.load(cu_seqlens_q_ptr + seq_idx + 1) - query_token_offset
-    padded_query_len = tl.load(cu_seqlens_padded_q_ptr + seq_idx + 1) - tl.load(cu_seqlens_padded_q_ptr + seq_idx)
-    num_chunks = padded_query_len // chunk_size
+    query_len = (tl.load(cu_seqlens_q_ptr + seq_idx + 1) - query_token_offset).to(tl.int32)
+    padded_query_len = (tl.load(cu_seqlens_padded_q_ptr + seq_idx + 1) - tl.load(cu_seqlens_padded_q_ptr + seq_idx)).to(tl.int32)
+    num_chunks = (padded_query_len // chunk_size).to(tl.int32)
     # if chunk_idx == 0:
     #     chunk_scheduled_len = tl.minimum(chunk_size, cache_len + query_len) - cache_len
     # else:
@@ -224,8 +224,8 @@ def localize_this_pid_with_offset(
     cur_cu_cache_len = tl.load(cu_cache_lens_ptr + seq_idx)
     next_cu_cache_len = tl.load(cu_cache_lens_ptr + seq_idx + 1)
 
-    query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
-    cache_len = next_cu_cache_len - cur_cu_cache_len
+    query_len = (cur_batch_in_all_stop_index - cur_batch_in_all_start_index).to(tl.int32)
+    cache_len = (next_cu_cache_len - cur_cu_cache_len).to(tl.int32)
 
     return seq_idx, q_block_local_idx, query_len, cur_batch_in_all_start_index, cache_len
 
@@ -294,7 +294,7 @@ def localize_memory_and_ks_ptrs(
 
 @triton.jit
 def slice_read_2d(
-    x, pos, dim: tl.constexpr,
+    x, dim: tl.constexpr, pos,
     x_size0: tl.constexpr, x_size1: tl.constexpr,
     p_size: tl.constexpr):
     if dim == 0:
@@ -340,7 +340,7 @@ def block_sympow_m_mma(
     if tile_idx_0 != tile_idx_1:
         phi_x *= 2
     acc = tl.dot(phi_x, y, acc) # [d_tile**2, N]
-    l = tl.sum(phi_x, axis=1) # [d_tile**2]
+    l = l + tl.sum(phi_x, axis=1) # [d_tile**2]
     return acc, l
 
 
@@ -414,7 +414,7 @@ def cumsum_intra_chunk_gate(
         cache_blk_idx = tl.load(block_table_ptr + seq_idx * block_table_stride_0 + cache_blk_seq_idx * block_table_stride_1)
         last_cached_gate = tl.load(gate_cache_ptr + cache_blk_idx * gate_cache_stride_0 + head_idx * gate_cache_stride_1 + (chunk_size - 1) * gate_cache_stride_2).to(tl.float32)
     else:
-        last_cached_gate = tl.zeros((1,), dtype=tl.float32)
+        last_cached_gate = 0.0
 
     if query_len == 1: # just decoding
         gate_ptrs = gate_ptr + query_start_idx * gate_stride_0 + head_idx * gate_stride_1
@@ -433,13 +433,13 @@ def cumsum_intra_chunk_gate(
 
 
 @triton.jit
-def discount(
-    x, # [N, D]
-    cum_log_gates, # [M]
+def discount_keys(
+    x, # [D, N]
+    cum_log_gates, # [N]
     last_gate, # [1]
 ):
     reversed_cum_log_gates = last_gate - cum_log_gates
-    discounted_x = x * reversed_cum_log_gates.exp()
+    discounted_x = x * reversed_cum_log_gates.exp()[None, :]
     return discounted_x.to(x.dtype)
 
 
@@ -539,26 +539,26 @@ def update_intra_chunk_memory_and_cache_3d(
         for tid in tl.range(0, tl.cdiv(cache_len, BLOCK_T)):
             range_t = tl.arange(0, BLOCK_T) + tid * BLOCK_T
             mask_t = range_t < cache_len
-            cached_keys = tl.load(key_cache_ptr + range_t[:, None] * key_cache_stride_2 + range_dim[None, :] * key_cache_stride_3, mask=mask_t[:, None], other=0)
+            cached_keys = tl.load(key_cache_ptr + range_t[None, :] * key_cache_stride_2 + range_dim[:, None] * key_cache_stride_3, mask=mask_t[None, :], other=0)
             cached_values = tl.load(value_cache_ptr + range_t[:, None] * value_cache_stride_2 + range_dim[None, :] * value_cache_stride_3, mask=mask_t[:, None], other=0)
-            cached_gates = tl.load(gate_cache_ptr + range_t[:, None] * gate_cache_stride_2, mask=mask_t, other=0)
+            cached_gates = tl.load(gate_cache_ptr + range_t * gate_cache_stride_2, mask=mask_t, other=0)
             # discount keys, note that the last gate is actully in the scheduled tokens
             last_gate = tl.load(gate_ptr + (local_schedule_len - 1) * gate_stride_0).to(tl.float32)
-            discounted_keys = discount(cached_keys, cached_gates, last_gate)
-            acc, l = block_sympow_m_mma(discounted_keys, cached_values, acc, l, head_dim, power, d_tile, tile_idx_0, tile_idx_1)
+            discounted_keys = discount_keys(cached_keys, cached_gates, last_gate)
+            acc, l = block_sympow_m_mma(discounted_keys, cached_values, acc, l, BLOCK_T, head_dim, power, d_tile, tile_idx_0, tile_idx_1)
         
     # handle scheduled tokens, update_state if enough tokens to fill a chunk
     if local_cache_len + local_schedule_len == chunk_size:
         for tid in tl.range(0, tl.cdiv(local_schedule_len, BLOCK_T)):
             range_t = tl.arange(0, BLOCK_T) + tid * BLOCK_T
             mask_t = range_t < local_schedule_len
-            keys = tl.load(key_ptr + range_t[:, None] * key_stride_0 + range_dim[None, :] * key_stride_2, mask=mask_t[:, None], other=0)
+            keys = tl.load(key_ptr + range_t[None, :] * key_stride_0 + range_dim[:, None] * key_stride_2, mask=mask_t[None, :], other=0)
             values = tl.load(value_ptr + range_t[:, None] * value_stride_0 + range_dim[None, :] * value_stride_2, mask=mask_t[:, None], other=0)
             gates = tl.load(gate_ptr + range_t * gate_stride_0, mask=mask_t, other=0)
             # discount keys
             last_gate = tl.load(gate_ptr + (local_schedule_len - 1) * gate_stride_0).to(tl.float32)
-            discounted_keys = discount(keys, gates, last_gate)
-            acc, l = block_sympow_m_mma(keys, values, acc, l, head_dim, power, d_tile, tile_idx_0, tile_idx_1)
+            discounted_keys = discount_keys(keys, gates, last_gate)
+            acc, l = block_sympow_m_mma(discounted_keys, values, acc, l, BLOCK_T, head_dim, power, d_tile, tile_idx_0, tile_idx_1)
 
         memory_ptr, ks_ptr = localize_memory_and_ks_ptrs(memory_ptr, ks_ptr, block_table_ptr, last_memorized_blk_idx_ptr, seq_idx, head_idx, cache_len, local_chunk_idx, block_table_stride_0, block_table_stride_1, memory_stride_0, memory_stride_1, ks_stride_0, ks_stride_1)
 
@@ -581,7 +581,7 @@ def update_intra_chunk_memory_and_cache_3d(
             range_t_cache = tl.arange(0, BLOCK_T) + tid * BLOCK_T + local_cache_len
             key_cache_ptrs = key_cache_ptr + range_t_cache[:, None] * key_cache_stride_2 + range_dim[None, :] * key_cache_stride_3
             value_cache_ptrs = value_cache_ptr + range_t_cache[:, None] * value_cache_stride_2 + range_dim[None, :] * value_cache_stride_3
-            gate_cache_ptrs = gate_cache_ptr + range_t_cache[:, None] * gate_cache_stride_2
+            gate_cache_ptrs = gate_cache_ptr + range_t_cache * gate_cache_stride_2
 
             tl.store(key_cache_ptrs, keys, mask=mask_t[:, None])
             tl.store(value_cache_ptrs, values, mask=mask_t[:, None])
@@ -761,12 +761,15 @@ def query_cache(
     Q, # [BLOCK_M, HEAD_SIZE_PADDED]
     GQ, # [BLOCK_M]
     query_pos, # [BLOCK_M]
+    acc, # [BLOCK_M, HEAD_SIZE_PADDED]
+    L, # [BLOCK_M]
+    M, # [BLOCK_M]
     key_ptr, # [num_tokens, num_kv_heads, head_dim]
     value_ptr, # [num_tokens, num_kv_heads, head_dim]
     gate_ptr, # [num_tokens, num_key_heads]
-    key_cache_ptr, # [num_blks, num_kv_heads, chunk_size, head_dim]
-    value_cache_ptr, # [num_blks, num_kv_heads, chunk_size, head_dim]
-    gate_cache_ptr, # [num_blks, num_kv_heads, chunk_size]
+    key_cache_ptr, # [num_blks, chunk_size, num_kv_heads, head_dim]
+    value_cache_ptr, # [num_blks, chunk_size, num_kv_heads, head_dim]
+    gate_cache_ptr, # [num_blks, chunk_size, num_kv_heads]
     offs_t, # [TILE_SIZE]
     offs_d, # [HEAD_SIZE_PADDED]
     query_mask, # [BLOCK_M]
@@ -813,14 +816,14 @@ def query_cache(
         tile_mask = seq_offset < chunk_cache_len
 
         v_offset = (
-            physical_block_idx[:, None] * value_cache_stride_0
+            physical_block_idx * value_cache_stride_0
             + kv_head_idx * value_cache_stride_2
             + offs_d[None, :] * value_cache_stride_3
             + (seq_offset % BLOCK_SIZE)[:, None] * value_cache_stride_1
         )
 
         k_offset = (
-            physical_block_idx[None, :] * key_cache_stride_0
+            physical_block_idx * key_cache_stride_0
             + kv_head_idx * key_cache_stride_2
             + offs_d[:, None] * key_cache_stride_3
             + (seq_offset % BLOCK_SIZE)[None, :] * key_cache_stride_1
@@ -828,7 +831,7 @@ def query_cache(
 
         gk_offset = (
             physical_block_idx * gate_cache_stride_0
-            + kv_head_idx * gate_cache_stride_2,
+            + kv_head_idx * gate_cache_stride_2
             + (seq_offset % BLOCK_SIZE) * gate_cache_stride_1
         )
 
@@ -855,15 +858,15 @@ def query_cache(
 
         causal_mask = seq_offset[None, :] < query_pos[:, None] + 1
 
-        mask = query_mask & causal_mask
+        mask = query_mask[:, None] & causal_mask
 
-        acc, L, M = attention_inner(Q, K, V, GQ, GK, mask, acc, L, M, scale, BLOCK_M, TILE_SIZE, deg)
+        # acc, L, M = attention_inner(Q, K, V, GQ, GK, mask, acc, L, M, scale, BLOCK_M, TILE_SIZE, deg)
 
     # iterate through scheduled tiles
     for j in tl.range(scheduled_tile_start, scheduled_tile_end):
         seq_pos = j * TILE_SIZE + chunk_size * chunk_idx + offs_t
         tile_mask = tl.where(seq_pos >= cache_len, 1, 0).to(tl.int1)
-        tile_mask = tile_mask & tl.where(seq_pos < cache_len + query_len).to(tl.int1)
+        tile_mask = tile_mask & tl.where(seq_pos < cache_len + query_len, 1, 0).to(tl.int1)
         kv_offset = query_token_offset + seq_pos - cache_len
 
         v_offset = (
@@ -906,9 +909,9 @@ def query_cache(
 
         causal_mask = seq_pos[None, :] < query_pos[:, None] + 1
 
-        mask = query_mask & causal_mask
+        mask = query_mask[:, None] & causal_mask
 
-        acc, L, M = attention_inner(Q, K, V, GQ, GK, mask, acc, L, M, scale, BLOCK_M, TILE_SIZE, deg)
+        # acc, L, M = attention_inner(Q, K, V, GQ, GK, mask, acc, L, M, scale, BLOCK_M, TILE_SIZE, deg)
 
     return acc, L, M
 
@@ -928,8 +931,8 @@ def query_memory(
     Q, # [BLOCK_M, HEAD_SIZE]
     GQ, # [BLOCK_M]
     acc, # [BLOCK_M, HEAD_SIZE]
-    M, # [BLOCK_M]
     L, # [BLOCK_M]
+    M, # [BLOCK_M]
     memory_ptr, # [num_blks, num_kv_heads, state_dim, head_dim]
     ks_ptr, # [num_blks, num_kv_heads, state_dim]
     block_table_ptr, # [num_reqs, max_num_blocks_per_req]
@@ -1119,11 +1122,12 @@ def unified_query_state_2d(
     ).to(tl.int64)
 
     # Query against cache and incoming scheduled tokens
-    acc, L, M = query_cache(Q, GQ, query_pos, key_ptr, value_ptr, gate_ptr, key_cache_ptr, value_cache_ptr, gate_cache_ptr, offs_t, offs_d, query_mask_0, query_mask_1, dim_mask, first_cached_block_idx, query_token_offset, kv_head_idx, chunk_idx, cache_len, query_len, chunk_cache_len, cached_tile_end, scheduled_tile_start, scheduled_tile_end, scale, deg, chunk_size, BLOCK_M, TILE_SIZE, BLOCK_SIZE, key_cache_stride_0, key_cache_stride_1, key_cache_stride_2, key_cache_stride_3, value_cache_stride_0, value_cache_stride_1, value_cache_stride_2, value_cache_stride_3, gate_cache_stride_0, gate_cache_stride_1, gate_cache_stride_2, key_stride_0, key_stride_1, key_stride_2, value_stride_0, value_stride_1, value_stride_2, gate_stride_0, gate_stride_1)
+    query_mask = query_mask_0 & query_mask_1
+    acc, L, M = query_cache(Q, GQ, query_pos, acc, L, M, key_ptr, value_ptr, gate_ptr, key_cache_ptr, value_cache_ptr, gate_cache_ptr, offs_t, offs_d, query_mask, dim_mask, first_cached_block_idx, query_token_offset, kv_head_idx, chunk_idx, cache_len, query_len, chunk_cache_len, cached_tile_end, scheduled_tile_start, scheduled_tile_end, scale, deg, chunk_size, BLOCK_M, TILE_SIZE, BLOCK_SIZE, key_cache_stride_0, key_cache_stride_1, key_cache_stride_2, key_cache_stride_3, value_cache_stride_0, value_cache_stride_1, value_cache_stride_2, value_cache_stride_3, gate_cache_stride_0, gate_cache_stride_1, gate_cache_stride_2, key_stride_0, key_stride_1, key_stride_2, value_stride_0, value_stride_1, value_stride_2, gate_stride_0, gate_stride_1)
 
     # Query against memory
     if last_memorized_blk_idx >= 0: # skip if no memory yet
-        acc, L, M = query_memory(Q, acc, M, L, memory_ptr, ks_ptr, block_tables_ptr, offs_d, scale, last_memorized_blk_idx, seq_idx, chunk_idx, kv_head_idx, d_tile, deg, state_dim, HEAD_SIZE, BLOCK_M, block_table_stride_0, memory_stride_0, memory_stride_1, memory_stride_2, memory_stride_3, ks_stride_0, ks_stride_1, ks_stride_2)
+        acc, L = query_memory(Q, GQ, acc, L, M, memory_ptr, ks_ptr, block_tables_ptr, offs_d, scale, last_memorized_blk_idx, seq_idx, chunk_idx, kv_head_idx, d_tile, deg, state_dim, HEAD_SIZE, BLOCK_M, block_table_stride_0, memory_stride_0, memory_stride_1, memory_stride_2, memory_stride_3, ks_stride_0, ks_stride_1, ks_stride_2)
                 
     # epilogue
     acc = acc / L[:, None]
@@ -1142,6 +1146,39 @@ def unified_query_state_2d(
 
 
 # === Interface ===
+
+@lru_cache(maxsize=100)
+def find_block_sizes(chunk_size: int, num_queries_per_kv: int) -> tuple[int, int]:
+    """ Find BLOCK_Q and BLOCK_M such that
+    1. chunk_size is divisible by BLOCK_Q
+    2. BLOCK_M >= BLOCK_Q * num_queries_per_kv
+    3. BLOCK_M is a power of 2 and >= 16
+    4. BLOCK_M is as small as possible
+    """
+    # Find all divisors of chunk_size
+    divisors = []
+    for i in range(1, int(math.sqrt(chunk_size)) + 1):
+        if chunk_size % i == 0:
+            divisors.append(i)
+            if i != chunk_size // i:
+                divisors.append(chunk_size // i)
+    divisors.sort()
+    
+    # Start with the smallest power of 2 that is >= 16
+    block_m = 16
+    
+    # Try increasing powers of 2 for BLOCK_M
+    while block_m <= chunk_size * num_queries_per_kv:
+        # Find the smallest divisor (BLOCK_Q) that satisfies BLOCK_Q * num_queries_per_kv <= BLOCK_M
+        for block_q in divisors:
+            if block_q * num_queries_per_kv <= block_m:
+                return block_q, block_m
+        
+        # Try next power of 2
+        block_m *= 2
+    
+    # Fallback: shouldn't reach here if inputs are reasonable
+    return chunk_size, block_m
 
 def query_state(
     output: torch.Tensor, # [num_tokens, num_query_heads, head_dim]
@@ -1174,11 +1211,7 @@ def query_state(
     chunk_size = key_cache.shape[2]
     state_dim = memory.shape[2]
 
-    BLOCK_M = (
-        16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
-    )
-    BLOCK_Q = BLOCK_M // num_queries_per_kv
-    assert chunk_size % BLOCK_Q == 0, f"chunk_size {chunk_size} must be divisible by BLOCK_Q {BLOCK_Q}"
+    BLOCK_Q, BLOCK_M = find_block_sizes(chunk_size, num_queries_per_kv)
     
     # The attention pattern is a chunked attention pattern, but it's irregular at the
     # beginning and the end of the sequence. To illustrate, we use "c" for computed token,
