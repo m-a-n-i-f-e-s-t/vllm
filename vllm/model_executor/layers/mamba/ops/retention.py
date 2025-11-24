@@ -335,7 +335,7 @@ def block_sympow_m_mma(
     x2_range = tile_idx_1 * d_tile + d_tile_range
     x1 = slice_read_2d(x, 0, x1_range, dim, K, d_tile) # [d_tile, K]
     x2 = slice_read_2d(x, 0, x2_range, dim, K, d_tile) # [d_tile, K]
-    x1_x2 = x1[None, :, :] * x2[:, None, :] # [d_tile, d_tile, K]
+    x1_x2 = x1[:, None, :] * x2[None, :, :] # [d_tile, d_tile, K]
     phi_x = x1_x2.reshape(d_tile*d_tile, K) # [d_tile**2, K]
     if tile_idx_0 != tile_idx_1:
         phi_x *= 2
@@ -375,7 +375,6 @@ def block_sympow_k_mma(
 
 
 # === Update State Kernels ===
-
 
 @triton.jit
 def cumsum_intra_chunk_gate(
@@ -687,7 +686,7 @@ def cumsum_inter_chunk_memory(
 
     # cumsum through all full blocks for the request
     for chunk_idx in tl.range(num_full_chunks):
-        blk_seq_idx = initial_memory_blk_seq_idx + chunk_idx
+        blk_seq_idx = initial_memory_blk_seq_idx + chunk_idx + 1
         blk_idx = tl.load(blk_table_ptr + blk_seq_idx * block_table_stride_1).to(tl.int64)
         memory, ks = read_memory_and_ks(memory_ptr, ks_ptr, blk_idx, BLOCK_S, head_dim, memory_stride_0, memory_stride_2, memory_stride_3, ks_stride_0, ks_stride_2)
         gate = tl.load(gate_ptr + (this_schedule_len - 1) * gate_stride_0).to(tl.float32) # [1]
@@ -932,7 +931,7 @@ def query_memory(
     M, # [BLOCK_M]
     L, # [BLOCK_M]
     memory_ptr, # [num_blks, num_kv_heads, state_dim, head_dim]
-    sk_ptr, # [num_blks, num_kv_heads, state_dim]
+    ks_ptr, # [num_blks, num_kv_heads, state_dim]
     block_table_ptr, # [num_reqs, max_num_blocks_per_req]
     offs_d, # [HEAD_SIZE]
     scale: tl.float32, # float32
@@ -969,7 +968,7 @@ def query_memory(
         for dtile_1 in tl.range(d_tile, HEAD_SIZE // d_tile):
             state_offset = dtile_0 * HEAD_SIZE * d_tile + dtile_1 * d_tile * d_tile + offs_s
             memory = tl.load(memory_ptr + memory_block_idx * memory_stride_0 + kv_head_idx * memory_stride_1 + state_offset[:, None] * memory_stride_2 + offs_d[None, :] * memory_stride_3)
-            ks = tl.load(sk_ptr + memory_block_idx * ks_stride_0 + kv_head_idx * ks_stride_1 + state_offset * ks_stride_2)
+            ks = tl.load(ks_ptr + memory_block_idx * ks_stride_0 + kv_head_idx * ks_stride_1 + state_offset * ks_stride_2)
             acc, L = block_sympow_k_mma(Q, memory, ks, acc, L, scale_mem, BLOCK_M, HEAD_SIZE, deg, d_tile, dtile_0, dtile_1)
     return acc, L
 
@@ -986,7 +985,7 @@ def unified_query_state_2d(
     value_cache_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
     gate_cache_ptr,  # [num_blks, blk_size, num_kv_heads]
     memory_ptr,  # [num_blks, num_kv_heads, state_dim, head_size]
-    sk_ptr,  # [num_blks, num_kv_heads, state_dim]
+    ks_ptr,  # [num_blks, num_kv_heads, state_dim]
     block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
     last_memorized_blk_idx_ptr, # [num_reqs]
     cu_seqlens_q_ptr,  # [num_seqs+1]
@@ -1124,7 +1123,7 @@ def unified_query_state_2d(
 
     # Query against memory
     if last_memorized_blk_idx >= 0: # skip if no memory yet
-        acc, L, M = query_memory(Q, acc, M, L, memory_ptr, sk_ptr, block_tables_ptr, offs_d, scale, last_memorized_blk_idx, seq_idx, chunk_idx, kv_head_idx, d_tile, deg, state_dim, HEAD_SIZE, BLOCK_M, block_table_stride_0, memory_stride_0, memory_stride_1, memory_stride_2, memory_stride_3, ks_stride_0, ks_stride_1, ks_stride_2)
+        acc, L, M = query_memory(Q, acc, M, L, memory_ptr, ks_ptr, block_tables_ptr, offs_d, scale, last_memorized_blk_idx, seq_idx, chunk_idx, kv_head_idx, d_tile, deg, state_dim, HEAD_SIZE, BLOCK_M, block_table_stride_0, memory_stride_0, memory_stride_1, memory_stride_2, memory_stride_3, ks_stride_0, ks_stride_1, ks_stride_2)
                 
     # epilogue
     acc = acc / L[:, None]
@@ -1247,7 +1246,6 @@ def query_state(
 
 
 def update_state(
-    query: torch.Tensor, # [num_tokens, num_query_heads, head_dim]
     key: torch.Tensor, # [num_tokens, num_kv_heads, head_dim]
     value: torch.Tensor, # [num_tokens, num_kv_heads, head_dim]
     gate: torch.Tensor, # [num_tokens, num_kv_heads]
@@ -1270,7 +1268,7 @@ def update_state(
     # Here we want to launch \sum_i(cdiv(query_len[i], chunk_size)) kernels
     # but materializing cu_seqlens_q on cpu is slow, so we take its uppper bound
     num_seqs = seq_lens.shape[0]
-    num_tokens = query.shape[0]
+    num_tokens = key.shape[0]
     total_chunks = num_tokens // chunk_size + num_seqs
     num_kv_heads, head_dim = key.shape[1], key.shape[2]
     state_dim = memory.shape[2]
@@ -1380,7 +1378,6 @@ def power_retention_varlen(
     last_hashed_memory_blk_idx[i] the last block index in request i's block table that has memory computed, which is also the last block hashed by vllm. If there is no memory computed, last_hashed_memory_blk_idx[i] = -1.
     """
     update_state(
-        query,
         key,
         value,
         gate,
