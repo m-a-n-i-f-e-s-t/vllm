@@ -243,27 +243,27 @@ def localize_d_tile_idxs(
 
 @triton.jit
 def localize_cache_ptrs(
-    key_cache_ptr, # [num_blks, num_kv_heads, chunk_size, head_dim]
-    value_cache_ptr, # [num_blks, num_kv_heads, chunk_size, head_dim]
-    gate_cache_ptr, # [num_blks, num_kv_heads, chunk_size]
+    key_cache_ptr, # [num_blks, chunk_size, num_kv_heads, head_dim]
+    value_cache_ptr, # [num_blks, chunk_size, num_kv_heads, head_dim]
+    gate_cache_ptr, # [num_blks, chunk_size, num_kv_heads]
     block_table_ptr, # [num_reqs, max_num_blocks_per_req]
     last_memorized_blk_idx_ptr, # [num_reqs]
     seq_idx: tl.int32, # int
     head_idx: tl.int32, # int
-    block_table_stride_0: tl.int32, # int
-    block_table_stride_1: tl.int32, # int
+    block_table_stride_0: tl.int64, # int
+    block_table_stride_1: tl.constexpr, # int
     key_cache_stride_0: tl.int64, # int
-    key_cache_stride_1: tl.int64, # int
+    key_cache_stride_2: tl.int64, # int
     value_cache_stride_0: tl.int64, # int
-    value_cache_stride_1: tl.int64, # int
+    value_cache_stride_2: tl.int64, # int
     gate_cache_stride_0: tl.int64, # int
-    gate_cache_stride_1: tl.int64, # int
+    gate_cache_stride_2: tl.int64, # int
 ):
     cur_block_seq_idx = tl.load(last_memorized_blk_idx_ptr + seq_idx) + 1
     cur_block_idx = tl.load(block_table_ptr + seq_idx * block_table_stride_0 + cur_block_seq_idx * block_table_stride_1).to(tl.int64)
-    key_cache_ptr += cur_block_idx * key_cache_stride_0 + head_idx * key_cache_stride_1
-    value_cache_ptr += cur_block_idx * value_cache_stride_0 + head_idx * value_cache_stride_1
-    gate_cache_ptr += cur_block_idx * gate_cache_stride_0 + head_idx * gate_cache_stride_1
+    key_cache_ptr += cur_block_idx * key_cache_stride_0 + head_idx * key_cache_stride_2
+    value_cache_ptr += cur_block_idx * value_cache_stride_0 + head_idx * value_cache_stride_2
+    gate_cache_ptr += cur_block_idx * gate_cache_stride_0 + head_idx * gate_cache_stride_2
     return key_cache_ptr, value_cache_ptr, gate_cache_ptr
 
 
@@ -379,7 +379,7 @@ def block_sympow_k_mma(
 @triton.jit
 def cumsum_intra_chunk_gate(
     gate_ptr, # [num_tokens, num_kv_heads]
-    gate_cache_ptr, # [num_blks, num_kv_heads, chunk_size]
+    gate_cache_ptr, # [num_blks, chunk_size, num_kv_heads]
     block_table_ptr, # [num_reqs, max_num_blocks_per_req]
     cu_seqlens_q_ptr, # [num_reqs + 1]
     cache_lens_ptr, # [num_reqs]
@@ -412,7 +412,7 @@ def cumsum_intra_chunk_gate(
     if cache_len > 0 and local_chunk_idx == 0:
         cache_blk_seq_idx = tl.load(last_memorized_blk_idx_ptr + seq_idx) + 1
         cache_blk_idx = tl.load(block_table_ptr + seq_idx * block_table_stride_0 + cache_blk_seq_idx * block_table_stride_1)
-        last_cached_gate = tl.load(gate_cache_ptr + cache_blk_idx * gate_cache_stride_0 + head_idx * gate_cache_stride_1 + (chunk_size - 1) * gate_cache_stride_2).to(tl.float32)
+        last_cached_gate = tl.load(gate_cache_ptr + cache_blk_idx * gate_cache_stride_0 + head_idx * gate_cache_stride_2 + (chunk_size - 1) * gate_cache_stride_1).to(tl.float32)
     else:
         last_cached_gate = 0.0
 
@@ -450,9 +450,9 @@ def update_intra_chunk_memory_and_cache_3d(
     gate_ptr, # [num_tokens, num_kv_heads]
     memory_ptr, # [num_blks, num_kv_heads, state_dim, head_dim]
     ks_ptr, # [num_blks, num_kv_heads, state_dim]
-    key_cache_ptr, # [num_blks, num_kv_heads, chunk_size, head_dim]
-    value_cache_ptr, # [num_blks, num_kv_heads, chunk_size, head_dim]
-    gate_cache_ptr, # [num_blks, num_kv_heads, chunk_size]
+    key_cache_ptr, # [num_blks, chunk_size, num_kv_heads, head_dim]
+    value_cache_ptr, # [num_blks, chunk_size, num_kv_heads, head_dim]
+    gate_cache_ptr, # [num_blks, chunk_size, num_kv_heads]
     block_table_ptr, # [num_reqs, max_num_blocks_per_req]
     cu_seqlens_q_ptr, # [num_reqs + 1]
     cu_cache_lens_ptr, # [num_reqs + 1]
@@ -517,18 +517,17 @@ def update_intra_chunk_memory_and_cache_3d(
     acc = tl.zeros((BLOCK_S, head_dim), dtype=tl.float32)
     l = tl.zeros((BLOCK_S,), dtype=tl.float32)
 
-    key_cache_ptr, value_cache_ptr, gate_cache_ptr = localize_cache_ptrs(key_cache_ptr, value_cache_ptr, gate_cache_ptr, block_table_ptr, last_memorized_blk_idx_ptr, seq_idx, head_idx, block_table_stride_0, block_table_stride_1, key_cache_stride_0, key_cache_stride_1, value_cache_stride_0, value_cache_stride_1, gate_cache_stride_0, gate_cache_stride_1)
-    key_ptr = key_ptr + (query_start_idx + local_chunk_idx * chunk_size) * key_stride_0 + head_idx * key_stride_1
-    value_ptr = value_ptr + (query_start_idx + local_chunk_idx * chunk_size) * value_stride_0 + head_idx * value_stride_1
-    gate_ptr = gate_ptr + (query_start_idx + local_chunk_idx * chunk_size) * gate_stride_0 + head_idx * gate_stride_1
+    key_cache_ptr, value_cache_ptr, gate_cache_ptr = localize_cache_ptrs(key_cache_ptr, value_cache_ptr, gate_cache_ptr, block_table_ptr, last_memorized_blk_idx_ptr, seq_idx, head_idx, block_table_stride_0, block_table_stride_1, key_cache_stride_0, key_cache_stride_2, value_cache_stride_0, value_cache_stride_2, gate_cache_stride_0, gate_cache_stride_2)
 
     range_dim = tl.arange(0, head_dim)
     
     # assign all cached tokens to first chunk
-    if local_chunk_idx == 0:
-        local_cache_len = cache_len
-    else:
-        local_cache_len = 0
+    local_cache_len = tl.minimum(cache_len, tl.maximum(0, chunk_size - local_chunk_idx * chunk_size))
+    query_offset = tl.maximum(0, local_chunk_idx * chunk_size - cache_len)
+
+    key_ptr = key_ptr + (query_start_idx + query_offset).to(tl.int64) * key_stride_0 + head_idx * key_stride_1
+    value_ptr = value_ptr + (query_start_idx + query_offset).to(tl.int64) * value_stride_0 + head_idx * value_stride_1
+    gate_ptr = gate_ptr + (query_start_idx + query_offset).to(tl.int64) * gate_stride_0 + head_idx * gate_stride_1
 
     # the number of scheduled tokens this CTA needs to handle
     local_schedule_len = tl.minimum(cache_len + scheduled_len - local_chunk_idx * chunk_size, chunk_size) - local_cache_len
@@ -539,9 +538,9 @@ def update_intra_chunk_memory_and_cache_3d(
         for tid in tl.range(0, tl.cdiv(cache_len, BLOCK_T)):
             range_t = tl.arange(0, BLOCK_T) + tid * BLOCK_T
             mask_t = range_t < cache_len
-            cached_keys = tl.load(key_cache_ptr + range_t[None, :] * key_cache_stride_2 + range_dim[:, None] * key_cache_stride_3, mask=mask_t[None, :], other=0)
-            cached_values = tl.load(value_cache_ptr + range_t[:, None] * value_cache_stride_2 + range_dim[None, :] * value_cache_stride_3, mask=mask_t[:, None], other=0)
-            cached_gates = tl.load(gate_cache_ptr + range_t * gate_cache_stride_2, mask=mask_t, other=0)
+            cached_keys = tl.load(key_cache_ptr + range_t[None, :] * key_cache_stride_1 + range_dim[:, None] * key_cache_stride_3, mask=mask_t[None, :], other=0)
+            cached_values = tl.load(value_cache_ptr + range_t[:, None] * value_cache_stride_1 + range_dim[None, :] * value_cache_stride_3, mask=mask_t[:, None], other=0)
+            cached_gates = tl.load(gate_cache_ptr + range_t * gate_cache_stride_1, mask=mask_t, other=0)
             # discount keys, note that the last gate is actully in the scheduled tokens
             last_gate = tl.load(gate_ptr + (local_schedule_len - 1) * gate_stride_0).to(tl.float32)
             discounted_keys = discount_keys(cached_keys, cached_gates, last_gate)
@@ -579,10 +578,10 @@ def update_intra_chunk_memory_and_cache_3d(
                 values = tl.load(value_ptr + range_t[:, None] * value_stride_0 + range_dim[None, :] * value_stride_2, mask=mask_t[:, None], other=0)
                 gates = tl.load(gate_ptr + range_t * gate_stride_0, mask=mask_t, other=0)
 
-                range_t_cache = tl.arange(0, BLOCK_T) + tid * BLOCK_T + local_cache_len
-                key_cache_ptrs = key_cache_ptr + range_t_cache[:, None] * key_cache_stride_2 + range_dim[None, :] * key_cache_stride_3
-                value_cache_ptrs = value_cache_ptr + range_t_cache[:, None] * value_cache_stride_2 + range_dim[None, :] * value_cache_stride_3
-                gate_cache_ptrs = gate_cache_ptr + range_t_cache * gate_cache_stride_2
+                range_t_cache = tl.arange(0, BLOCK_T) + local_cache_len
+                key_cache_ptrs = key_cache_ptr + range_t_cache[:, None] * key_cache_stride_1 + range_dim[None, :] * key_cache_stride_3
+                value_cache_ptrs = value_cache_ptr + range_t_cache[:, None] * value_cache_stride_1 + range_dim[None, :] * value_cache_stride_3
+                gate_cache_ptrs = gate_cache_ptr + range_t_cache * gate_cache_stride_1
 
                 tl.store(key_cache_ptrs, keys, mask=mask_t[:, None])
                 tl.store(value_cache_ptrs, values, mask=mask_t[:, None])
@@ -592,9 +591,9 @@ def update_intra_chunk_memory_and_cache_3d(
             key = tl.load(key_ptr + range_dim[None, :] * key_stride_2)
             value = tl.load(value_ptr + range_dim[None, :] * value_stride_2)
             gate = tl.load(gate_ptr)
-            key_cache_ptrs = key_cache_ptr + local_cache_len * key_cache_stride_2 + range_dim[None, :] * key_cache_stride_3
-            value_cache_ptrs = value_cache_ptr + local_cache_len * value_cache_stride_2 + range_dim[None, :] * value_cache_stride_3
-            gate_cache_ptrs = gate_cache_ptr + local_cache_len * gate_cache_stride_2
+            key_cache_ptrs = key_cache_ptr + local_cache_len * key_cache_stride_1 + range_dim[None, :] * key_cache_stride_3
+            value_cache_ptrs = value_cache_ptr + local_cache_len * value_cache_stride_1 + range_dim[None, :] * value_cache_stride_3
+            gate_cache_ptrs = gate_cache_ptr + local_cache_len * gate_cache_stride_1
             tl.store(key_cache_ptrs, key)
             tl.store(value_cache_ptrs, value)
             tl.store(gate_cache_ptrs, gate)
@@ -1211,9 +1210,9 @@ def query_state(
     key: torch.Tensor, # [num_tokens, num_kv_heads, head_dim]
     value: torch.Tensor, # [num_tokens, num_kv_heads, head_dim]
     gate: torch.Tensor, # [num_tokens, num_key_heads]
-    key_cache: torch.Tensor, # [num_blocks, num_kv_heads, chunk_size, head_dim]
-    value_cache: torch.Tensor, # [num_blocks, num_kv_heads, chunk_size, head_dim]
-    gate_cache: torch.Tensor, # [num_blocks, num_kv_heads, chunk_size]
+    key_cache: torch.Tensor, # [num_blocks, chunk_size, num_kv_heads, head_dim]
+    value_cache: torch.Tensor, # [num_blocks, chunk_size, num_kv_heads, head_dim]
+    gate_cache: torch.Tensor, # [num_blocks, chunk_size, num_kv_heads]
     memory: torch.Tensor, # [num_blks, num_kv_heads, state_dim, head_dim]
     ks: torch.Tensor, # [num_blks, num_kv_heads, state_dim]
     block_table: torch.Tensor, # [num_reqs, max_num_blocks_per_req]
@@ -1309,9 +1308,9 @@ def update_state(
     gate: torch.Tensor, # [num_tokens, num_kv_heads]
     memory: torch.Tensor, # [num_blks, num_kv_heads, state_dim, head_dim]
     ks: torch.Tensor, # [num_blks, num_kv_heads, state_dim]
-    key_cache: torch.Tensor, # [num_blks, num_kv_heads, chunk_size,head_dim]
-    value_cache: torch.Tensor, # [num_blks, num_kv_heads, chunk_size, head_dim]
-    gate_cache: torch.Tensor, # [num_blks, num_kv_heads, chunk_size]
+    key_cache: torch.Tensor, # [num_blks, chunk_size, num_kv_heads, head_dim]
+    value_cache: torch.Tensor, # [num_blks, chunk_size, num_kv_heads, head_dim]
+    gate_cache: torch.Tensor, # [num_blks, chunk_size, num_kv_heads]
     block_table: torch.Tensor, # [num_reqs, max_num_blocks_per_req]
     cu_seqlens_q: torch.Tensor, # [num_reqs + 1]
     seq_lens: torch.Tensor, # [num_reqs]
@@ -1417,9 +1416,9 @@ def power_retention_varlen(
     gate: torch.Tensor, # [num_tokens, num_key_heads]
     memory: torch.Tensor, # [num_blks, num_kv_heads, state_dim, head_dim]
     ks: torch.Tensor, # [num_blks, num_kv_heads, state_dim]
-    key_cache, # [num_blks, num_kv_heads, chunk_size,head_dim]
-    value_cache: torch.Tensor, # [num_blks, num_kv_heads, chunk_size, head_dim]
-    gate_cache: torch.Tensor, # [num_blks, num_kv_heads, chunk_size]
+    key_cache, # [num_blks, chunk_size, num_kv_heads, head_dim]
+    value_cache: torch.Tensor, # [num_blks, chunk_size, num_kv_heads, head_dim]
+    gate_cache: torch.Tensor, # [num_blks, chunk_size, num_kv_heads]
     block_table: torch.Tensor, # [num_reqs, max_num_blocks_per_req]
     cu_seqlens_q: torch.Tensor, # [num_reqs + 1]
     seq_lens: torch.Tensor, # [num_reqs]
