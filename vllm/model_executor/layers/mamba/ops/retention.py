@@ -250,6 +250,7 @@ def localize_cache_ptrs(
     last_memorized_blk_idx_ptr, # [num_reqs]
     seq_idx: tl.int32, # int
     head_idx: tl.int32, # int
+    block_idx: tl.int32, # int
     block_table_stride_0: tl.int64, # int
     block_table_stride_1: tl.constexpr, # int
     key_cache_stride_0: tl.int64, # int
@@ -259,7 +260,7 @@ def localize_cache_ptrs(
     gate_cache_stride_0: tl.int64, # int
     gate_cache_stride_2: tl.int64, # int
 ):
-    cur_block_seq_idx = tl.load(last_memorized_blk_idx_ptr + seq_idx) + 1
+    cur_block_seq_idx = tl.load(last_memorized_blk_idx_ptr + seq_idx) + 1 + block_idx
     cur_block_idx = tl.load(block_table_ptr + seq_idx * block_table_stride_0 + cur_block_seq_idx * block_table_stride_1).to(tl.int64)
     key_cache_ptr += cur_block_idx * key_cache_stride_0 + head_idx * key_cache_stride_2
     value_cache_ptr += cur_block_idx * value_cache_stride_0 + head_idx * value_cache_stride_2
@@ -339,7 +340,7 @@ def block_sympow_m_mma(
     phi_x = x1_x2.reshape(d_tile*d_tile, K) # [d_tile**2, K]
     if tile_idx_0 != tile_idx_1:
         phi_x *= 2
-    acc = tl.dot(phi_x, y, acc) # [d_tile**2, N]
+    acc = tl.dot(phi_x, y, acc, allow_tf32=False) # [d_tile**2, N]
     l = l + tl.sum(phi_x, axis=1) # [d_tile**2]
     return acc, l
 
@@ -369,7 +370,7 @@ def block_sympow_k_mma(
 
     x1_x2 = x1[:, :, None] * x2[:, None, :] # [M, d_tile, d_tile]
     phi_x = x1_x2.reshape(M, d_tile*d_tile).to(y.dtype) # [M, d_tile**2]
-    acc = tl.dot(phi_x, y) * scale[:, None] + acc # [M, N]
+    acc = tl.dot(phi_x, y, allow_tf32=False) * scale[:, None] + acc # [M, N]
     l = tl.sum(phi_x * s[None, :], axis=1) * scale + l # [M]
     return acc, l
 
@@ -412,7 +413,7 @@ def cumsum_intra_chunk_gate(
     if cache_len > 0 and local_chunk_idx == 0:
         cache_blk_seq_idx = tl.load(last_memorized_blk_idx_ptr + seq_idx) + 1
         cache_blk_idx = tl.load(block_table_ptr + seq_idx * block_table_stride_0 + cache_blk_seq_idx * block_table_stride_1)
-        last_cached_gate = tl.load(gate_cache_ptr + cache_blk_idx * gate_cache_stride_0 + head_idx * gate_cache_stride_2 + (chunk_size - 1) * gate_cache_stride_1).to(tl.float32)
+        last_cached_gate = tl.load(gate_cache_ptr + cache_blk_idx * gate_cache_stride_0 + head_idx * gate_cache_stride_2 + (cache_len - 1) * gate_cache_stride_1).to(tl.float32)
     else:
         last_cached_gate = 0.0
 
@@ -509,7 +510,7 @@ def update_intra_chunk_memory_and_cache_3d(
     power: tl.constexpr = 2
     BLOCK_S: tl.constexpr = d_tile ** power
     seq_idx, local_chunk_idx, scheduled_len, query_start_idx, cache_len = localize_this_pid_with_offset(cu_seqlens_q_ptr, cu_cache_lens_ptr, block_global_idx, num_seqs, chunk_size)
-    tile_idx_0, tile_idx_1 = localize_d_tile_idxs(state_block_idx, head_dim, power)
+    tile_idx_0, tile_idx_1 = localize_d_tile_idxs(state_block_idx, head_dim // d_tile, power)
 
     if local_chunk_idx * chunk_size >= cache_len + scheduled_len:
         return
@@ -517,7 +518,7 @@ def update_intra_chunk_memory_and_cache_3d(
     acc = tl.zeros((BLOCK_S, head_dim), dtype=tl.float32)
     l = tl.zeros((BLOCK_S,), dtype=tl.float32)
 
-    key_cache_ptr, value_cache_ptr, gate_cache_ptr = localize_cache_ptrs(key_cache_ptr, value_cache_ptr, gate_cache_ptr, block_table_ptr, last_memorized_blk_idx_ptr, seq_idx, head_idx, block_table_stride_0, block_table_stride_1, key_cache_stride_0, key_cache_stride_2, value_cache_stride_0, value_cache_stride_2, gate_cache_stride_0, gate_cache_stride_2)
+    key_cache_ptr, value_cache_ptr, gate_cache_ptr = localize_cache_ptrs(key_cache_ptr, value_cache_ptr, gate_cache_ptr, block_table_ptr, last_memorized_blk_idx_ptr, seq_idx, head_idx, local_chunk_idx, block_table_stride_0, block_table_stride_1, key_cache_stride_0, key_cache_stride_2, value_cache_stride_0, value_cache_stride_2, gate_cache_stride_0, gate_cache_stride_2)
 
     range_dim = tl.arange(0, head_dim)
     
@@ -530,7 +531,7 @@ def update_intra_chunk_memory_and_cache_3d(
     gate_ptr = gate_ptr + (query_start_idx + query_offset).to(tl.int64) * gate_stride_0 + head_idx * gate_stride_1
 
     # the number of scheduled tokens this CTA needs to handle
-    local_schedule_len = tl.minimum(cache_len + scheduled_len - local_chunk_idx * chunk_size, chunk_size) - local_cache_len
+    local_schedule_len = tl.minimum(cache_len + scheduled_len - local_chunk_idx * chunk_size, chunk_size) - cache_len
 
     # handle cached tokens
     # update memory if cached tokens + scheduled tokens fills a chunk
@@ -563,13 +564,15 @@ def update_intra_chunk_memory_and_cache_3d(
 
         # store memory and ks
         range_s = tl.arange(0, BLOCK_S)
-        memory_ptrs = memory_ptr + (state_block_idx + range_s[:, None]) * memory_stride_2 + range_dim[None, :] * memory_stride_3
-        ks_ptrs = ks_ptr + (state_block_idx + range_s) * ks_stride_2
+        memory_ptrs = memory_ptr + (state_block_idx * BLOCK_S + range_s[:, None]) * memory_stride_2 + range_dim[None, :] * memory_stride_3
+        ks_ptrs = ks_ptr + (state_block_idx * BLOCK_S + range_s) * ks_stride_2
         tl.store(memory_ptrs, acc)
         tl.store(ks_ptrs, l)
 
     # otherwise just append the scheduled tokens to cache
     else:
+        if state_block_idx != 0: # only the first state block append tokens
+            return
         if local_schedule_len > 1:
             for tid in tl.range(0, tl.cdiv(local_schedule_len, BLOCK_T)):
                 range_t = tl.arange(0, BLOCK_T) + tid * BLOCK_T
@@ -578,7 +581,7 @@ def update_intra_chunk_memory_and_cache_3d(
                 values = tl.load(value_ptr + range_t[:, None] * value_stride_0 + range_dim[None, :] * value_stride_2, mask=mask_t[:, None], other=0)
                 gates = tl.load(gate_ptr + range_t * gate_stride_0, mask=mask_t, other=0)
 
-                range_t_cache = tl.arange(0, BLOCK_T) + local_cache_len
+                range_t_cache = range_t + local_cache_len
                 key_cache_ptrs = key_cache_ptr + range_t_cache[:, None] * key_cache_stride_1 + range_dim[None, :] * key_cache_stride_3
                 value_cache_ptrs = value_cache_ptr + range_t_cache[:, None] * value_cache_stride_1 + range_dim[None, :] * value_cache_stride_3
                 gate_cache_ptrs = gate_cache_ptr + range_t_cache * gate_cache_stride_1
