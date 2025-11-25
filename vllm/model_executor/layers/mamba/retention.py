@@ -106,7 +106,7 @@ class Retention(MambaBase, CustomOp):
 
     def get_state_shape(self) -> tuple[tuple[int, ...]]:
         return MambaStateShapeCalculator.retention_state_shape(
-            num_heads=self.num_heads,
+            num_heads=self.num_kv_heads,
             head_dim=self.head_dim,
             state_dim=self.state_dim,
             chunk_size=self.chunk_size,

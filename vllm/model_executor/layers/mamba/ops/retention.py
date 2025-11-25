@@ -571,21 +571,34 @@ def update_intra_chunk_memory_and_cache_3d(
 
     # otherwise just append the scheduled tokens to cache
     else:
-        for tid in tl.range(0, tl.cdiv(local_schedule_len, BLOCK_T)):
-            range_t = tl.arange(0, BLOCK_T) + tid * BLOCK_T
-            mask_t = range_t < local_schedule_len
-            keys = tl.load(key_ptr + range_t[:, None] * key_stride_0 + range_dim[None, :] * key_stride_2, mask=mask_t[:, None], other=0)
-            values = tl.load(value_ptr + range_t[:, None] * value_stride_0 + range_dim[None, :] * value_stride_2, mask=mask_t[:, None], other=0)
-            gates = tl.load(gate_ptr + range_t * gate_stride_0, mask=mask_t, other=0)
+        if local_schedule_len > 1:
+            for tid in tl.range(0, tl.cdiv(local_schedule_len, BLOCK_T)):
+                range_t = tl.arange(0, BLOCK_T) + tid * BLOCK_T
+                mask_t = range_t < local_schedule_len
+                keys = tl.load(key_ptr + range_t[:, None] * key_stride_0 + range_dim[None, :] * key_stride_2, mask=mask_t[:, None], other=0)
+                values = tl.load(value_ptr + range_t[:, None] * value_stride_0 + range_dim[None, :] * value_stride_2, mask=mask_t[:, None], other=0)
+                gates = tl.load(gate_ptr + range_t * gate_stride_0, mask=mask_t, other=0)
 
-            range_t_cache = tl.arange(0, BLOCK_T) + tid * BLOCK_T + local_cache_len
-            key_cache_ptrs = key_cache_ptr + range_t_cache[:, None] * key_cache_stride_2 + range_dim[None, :] * key_cache_stride_3
-            value_cache_ptrs = value_cache_ptr + range_t_cache[:, None] * value_cache_stride_2 + range_dim[None, :] * value_cache_stride_3
-            gate_cache_ptrs = gate_cache_ptr + range_t_cache * gate_cache_stride_2
+                range_t_cache = tl.arange(0, BLOCK_T) + tid * BLOCK_T + local_cache_len
+                key_cache_ptrs = key_cache_ptr + range_t_cache[:, None] * key_cache_stride_2 + range_dim[None, :] * key_cache_stride_3
+                value_cache_ptrs = value_cache_ptr + range_t_cache[:, None] * value_cache_stride_2 + range_dim[None, :] * value_cache_stride_3
+                gate_cache_ptrs = gate_cache_ptr + range_t_cache * gate_cache_stride_2
 
-            tl.store(key_cache_ptrs, keys, mask=mask_t[:, None])
-            tl.store(value_cache_ptrs, values, mask=mask_t[:, None])
-            tl.store(gate_cache_ptrs, gates, mask=mask_t)
+                tl.store(key_cache_ptrs, keys, mask=mask_t[:, None])
+                tl.store(value_cache_ptrs, values, mask=mask_t[:, None])
+                tl.store(gate_cache_ptrs, gates, mask=mask_t)
+
+        else: # specialize for decoding
+            key = tl.load(key_ptr + range_dim[None, :] * key_stride_2)
+            value = tl.load(value_ptr + range_dim[None, :] * value_stride_2)
+            gate = tl.load(gate_ptr)
+            key_cache_ptrs = key_cache_ptr + local_cache_len * key_cache_stride_2 + range_dim[None, :] * key_cache_stride_3
+            value_cache_ptrs = value_cache_ptr + local_cache_len * value_cache_stride_2 + range_dim[None, :] * value_cache_stride_3
+            gate_cache_ptrs = gate_cache_ptr + local_cache_len * gate_cache_stride_2
+            tl.store(key_cache_ptrs, key)
+            tl.store(value_cache_ptrs, value)
+            tl.store(gate_cache_ptrs, gate)
+
 
 
 @triton.jit
@@ -1345,7 +1358,7 @@ def update_state(
     total_chunks_including_cache = num_tokens // chunk_size + 2 * num_seqs
     BLOCK_S = d_tile ** deg
     num_state_blocks = state_dim // BLOCK_S
-    BLOCK_T = 64
+    BLOCK_T = 16
     update_intra_chunk_memory_and_cache_3d[(total_chunks_including_cache, num_kv_heads, num_state_blocks)](
         key,
         value,
