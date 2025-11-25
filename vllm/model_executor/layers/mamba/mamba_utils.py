@@ -111,8 +111,8 @@ class MambaStateShapeCalculator:
     ) -> tuple[tuple[int, int, int], ...]:
         state_shape = (num_heads, state_dim, head_dim)
         sk_shape = (num_heads, state_dim)
-        cache_shape = (num_heads, chunk_size, head_dim)
-        gate_shape = (num_heads, chunk_size)
+        cache_shape = (chunk_size, num_heads, head_dim)
+        gate_shape = (chunk_size, num_heads)
         return (state_shape, sk_shape, cache_shape, cache_shape, gate_shape)
 
     @classmethod

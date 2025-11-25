@@ -11,6 +11,7 @@ from vllm.v1.attention.backends.utils import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
     split_decodes_and_prefills,
+    AttentionCGSupport,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
 
@@ -44,6 +45,10 @@ class RetentionMetadata:
 class RetentionMetadataBuilder(AttentionMetadataBuilder[RetentionMetadata]):
     reorder_batch_threshold: int = 1
 
+    @classmethod
+    def get_cudagraph_support(cls, vllm_config: VllmConfig, kv_cache_spec: AttentionSpec) -> AttentionCGSupport:
+        return AttentionCGSupport.ALWAYS
+
     def __init__(
         self,
         kv_cache_spec: AttentionSpec,
@@ -60,7 +65,7 @@ class RetentionMetadataBuilder(AttentionMetadataBuilder[RetentionMetadata]):
         num_computed_tokens = common_attn_metadata.num_computed_tokens_cpu.to(device)
         cache_lens = num_computed_tokens % mamba_block_size
         cu_cache_lens = F.pad(torch.cumsum(cache_lens, dim=0), (1, 0), value=0)
-        last_memorized_blks = num_computed_tokens // mamba_block_size
+        last_memorized_blks = num_computed_tokens // mamba_block_size - 1
         non_memorized_lens = cache_lens + query_len
         # for query state, we artificially pad every request to block size to make kernel logic simpler
         padded_lens = ((non_memorized_lens + mamba_block_size - 1) // mamba_block_size) * mamba_block_size

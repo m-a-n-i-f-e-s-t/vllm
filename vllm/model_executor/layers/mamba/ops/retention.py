@@ -368,9 +368,9 @@ def block_sympow_k_mma(
     x2 = slice_read_2d(x, 1, x2_range, M, dim, d_tile) # [M, d_tile]
 
     x1_x2 = x1[:, :, None] * x2[:, None, :] # [M, d_tile, d_tile]
-    phi_x = x1_x2.reshape(M, d_tile*d_tile) # [M, d_tile**2]
-    acc = tl.dot(phi_x, y) * scale[:, None] + acc# [M, N]
-    l = tl.dot(phi_x, s[:, None]) * scale + l # [M]
+    phi_x = x1_x2.reshape(M, d_tile*d_tile).to(y.dtype) # [M, d_tile**2]
+    acc = tl.dot(phi_x, y) * scale[:, None] + acc # [M, N]
+    l = tl.sum(phi_x * s[None, :], axis=1) * scale + l # [M]
     return acc, l
 
 
@@ -860,7 +860,7 @@ def query_cache(
 
         mask = query_mask[:, None] & causal_mask
 
-        # acc, L, M = attention_inner(Q, K, V, GQ, GK, mask, acc, L, M, scale, BLOCK_M, TILE_SIZE, deg)
+        acc, L, M = attention_inner(Q, K, V, GQ, GK, mask, acc, L, M, scale, BLOCK_M, TILE_SIZE, deg)
 
     # iterate through scheduled tiles
     for j in tl.range(scheduled_tile_start, scheduled_tile_end):
@@ -870,13 +870,13 @@ def query_cache(
         kv_offset = query_token_offset + seq_pos - cache_len
 
         v_offset = (
-            kv_offset * value_stride_0
+            kv_offset[:, None] * value_stride_0
             + kv_head_idx * value_stride_1
             + offs_d[None, :] * value_stride_2
         )
 
         k_offset = (
-            kv_offset * key_stride_0
+            kv_offset[None, :] * key_stride_0
             + kv_head_idx * key_stride_1
             + offs_d[:, None] * key_stride_2
         )
@@ -911,7 +911,7 @@ def query_cache(
 
         mask = query_mask[:, None] & causal_mask
 
-        # acc, L, M = attention_inner(Q, K, V, GQ, GK, mask, acc, L, M, scale, BLOCK_M, TILE_SIZE, deg)
+        acc, L, M = attention_inner(Q, K, V, GQ, GK, mask, acc, L, M, scale, BLOCK_M, TILE_SIZE, deg)
 
     return acc, L, M
 
@@ -922,7 +922,7 @@ def discount_query(
     cum_log_gates, # [M]
     deg: tl.constexpr, # int
 ):
-    discounted_query = query * (cum_log_gates / deg).exp()
+    discounted_query = query * (cum_log_gates / deg).exp()[:, None]
     return discounted_query.to(query.dtype)
 
 
@@ -957,7 +957,7 @@ def query_memory(
     ks_stride_2: tl.constexpr, # int
 ):
     # scale down attention output for numerical stability
-    alpha = tl.max(tl.sqrt(state_dim), tl.exp(M)) # [BLOCK_M]
+    alpha = tl.maximum(tl.sqrt(state_dim), tl.exp(M)) # [BLOCK_M]
     adj_attn = tl.exp(M) / alpha # [BLOCK_M]
     acc = acc * adj_attn[:, None]
     L = L * adj_attn
@@ -965,7 +965,7 @@ def query_memory(
     memory_block_idx = tl.load(block_table_ptr + seq_idx * block_table_stride_0 + last_memorized_blk_idx + chunk_idx).to(tl.int64)
     BLOCK_S: tl.constexpr = d_tile ** deg
     offs_s = tl.arange(0, BLOCK_S)
-    scale_mem = (scale ** deg) / alpha # [BLOCK_M]
+    scale_mem = _power(scale, deg) / alpha # [BLOCK_M]
     Q = discount_query(Q, GQ, deg)
     for dtile_0 in tl.range(0, HEAD_SIZE // d_tile):
         for dtile_1 in tl.range(d_tile, HEAD_SIZE // d_tile):
@@ -974,6 +974,18 @@ def query_memory(
             ks = tl.load(ks_ptr + memory_block_idx * ks_stride_0 + kv_head_idx * ks_stride_1 + state_offset * ks_stride_2)
             acc, L = block_sympow_k_mma(Q, memory, ks, acc, L, scale_mem, BLOCK_M, HEAD_SIZE, deg, d_tile, dtile_0, dtile_1)
     return acc, L
+
+
+@triton.jit
+def _power(x, deg: tl.constexpr):
+    if deg == 2:
+        return x * x
+    elif deg == 3:
+        return x * x * x
+    elif deg == 4:
+        return x * x * x * x
+    else:
+        raise ValueError(f"Invalid degree: {deg}")
 
 
 # Adapted from https://github.com/vllm-project/vllm/blob/c6fa3895e90f6daef4d223188f6b4156311f40c9/vllm/attention/ops/triton_unified_attention.py#L57
@@ -989,7 +1001,7 @@ def unified_query_state_2d(
     gate_cache_ptr,  # [num_blks, blk_size, num_kv_heads]
     memory_ptr,  # [num_blks, num_kv_heads, state_dim, head_size]
     ks_ptr,  # [num_blks, num_kv_heads, state_dim]
-    block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
+    block_table_ptr,  # [num_seqs, max_num_blocks_per_seq]
     last_memorized_blk_idx_ptr, # [num_reqs]
     cu_seqlens_q_ptr,  # [num_seqs+1]
     cu_seqlens_padded_q_ptr, # [num_seqs + 1]
@@ -1006,7 +1018,7 @@ def unified_query_state_2d(
     BLOCK_M: tl.constexpr,  # int
     deg: tl.constexpr, # int
     chunk_size: tl.constexpr, # int
-    state_dim: tl.constexpr, # int
+    state_dim: tl.float32, # float (for stablization)
     output_stride_0: tl.int64,  # int
     output_stride_1: tl.int64,  # int, should be equal to head_size
     query_stride_0: tl.int64,  # int
@@ -1116,9 +1128,9 @@ def unified_query_state_2d(
     scheduled_tile_end = cdiv_fn(local_block_idx * BLOCK_Q, TILE_SIZE)
 
     # find cache block index
-    last_memorized_blk_idx = tl.load(last_memorized_blk_idx_ptr + seq_idx)
+    last_memorized_blk_idx = tl.load(last_memorized_blk_idx_ptr + seq_idx).to(tl.int64)
     first_cached_block_idx = tl.load(
-        block_tables_ptr + seq_idx * block_table_stride_0 + last_memorized_blk_idx + 1
+        block_table_ptr + seq_idx * block_table_stride_0 + last_memorized_blk_idx + 1
     ).to(tl.int64)
 
     # Query against cache and incoming scheduled tokens
@@ -1127,8 +1139,8 @@ def unified_query_state_2d(
 
     # Query against memory
     if last_memorized_blk_idx >= 0: # skip if no memory yet
-        acc, L = query_memory(Q, GQ, acc, L, M, memory_ptr, ks_ptr, block_tables_ptr, offs_d, scale, last_memorized_blk_idx, seq_idx, chunk_idx, kv_head_idx, d_tile, deg, state_dim, HEAD_SIZE, BLOCK_M, block_table_stride_0, memory_stride_0, memory_stride_1, memory_stride_2, memory_stride_3, ks_stride_0, ks_stride_1, ks_stride_2)
-                
+        acc, L = query_memory(Q, GQ, acc, L, M, memory_ptr, ks_ptr, block_table_ptr, offs_d, scale, last_memorized_blk_idx, seq_idx, chunk_idx, kv_head_idx, d_tile, deg, state_dim, HEAD_SIZE, BLOCK_M, block_table_stride_0, memory_stride_0, memory_stride_1, memory_stride_2, memory_stride_3, ks_stride_0, ks_stride_1, ks_stride_2)
+           
     # epilogue
     acc = acc / L[:, None]
 
@@ -1262,7 +1274,7 @@ def query_state(
         BLOCK_M,
         deg,
         chunk_size,
-        state_dim,
+        float(state_dim),
         *output.stride(),
         *query.stride(),
         *key.stride(),
