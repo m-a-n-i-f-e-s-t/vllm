@@ -181,8 +181,8 @@ def localize_this_pid_in_chunk(
     # get scheduled length
     query_token_offset = tl.load(cu_seqlens_q_ptr + seq_idx)
     query_len = (tl.load(cu_seqlens_q_ptr + seq_idx + 1) - query_token_offset).to(tl.int32)
-    padded_query_len = (tl.load(cu_seqlens_padded_q_ptr + seq_idx + 1) - tl.load(cu_seqlens_padded_q_ptr + seq_idx)).to(tl.int32)
-    num_chunks = (padded_query_len // chunk_size).to(tl.int32)
+    # padded_query_len = (tl.load(cu_seqlens_padded_q_ptr + seq_idx + 1) - tl.load(cu_seqlens_padded_q_ptr + seq_idx)).to(tl.int32)
+    # num_chunks = (padded_query_len // chunk_size).to(tl.int32)
     # if chunk_idx == 0:
     #     chunk_scheduled_len = tl.minimum(chunk_size, cache_len + query_len) - cache_len
     # else:
@@ -716,13 +716,13 @@ def cumsum_inter_chunk_memory(
 # === Query State Kernels ===
 @triton.jit
 def attention_inner(
-    Q, # [BLOCK_M, HEAD_SIZE_PADDED]
-    K, # [TILE_SIZE, HEAD_SIZE_PADDED]
+    Q, # [BLOCK_M, HEAD_SIZE]
+    K, # [HEAD_SIZE, TILE_SIZE]
     V, # [TILE_SIZE, HEAD_SIZE]
     GQ, # [BLOCK_M]
     GK, # [TILE_SIZE]
     mask, # [BLOCK_M, TILE_SIZE]
-    acc, # [BLOCK_M, HEAD_SIZE_PADDED]
+    acc, # [BLOCK_M, HEAD_SIZE]
     L, # [BLOCK_M]
     M, # [BLOCK_M]
     scale, # float32
@@ -734,7 +734,7 @@ def attention_inner(
     # S : (BLOCK_M, TILE_SIZE)
     S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
 
-    S += scale * tl.dot(Q, K)
+    S += scale * tl.dot(Q, K, allow_tf32=False)
 
     S = tl.log(S.abs() + 1e-7) * deg
 
@@ -767,7 +767,7 @@ def attention_inner(
     M = m_j
 
     # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-    acc += tl.dot(P.to(V.dtype), V)
+    acc += tl.dot(P.to(V.dtype), V, allow_tf32=False)
     return acc, L, M
     
 
@@ -826,56 +826,56 @@ def query_cache(
     gate_stride_1: tl.constexpr, # int
 ):
     # iterate through cached tiles
-    for j in tl.range(0, cached_tile_end):
-        seq_offset = j * TILE_SIZE + offs_t
-        tile_mask = seq_offset < chunk_cache_len
+    # for j in tl.range(0, cached_tile_end):
+    #     seq_offset = j * TILE_SIZE + offs_t
+    #     tile_mask = seq_offset < chunk_cache_len
 
-        v_offset = (
-            physical_block_idx * value_cache_stride_0
-            + kv_head_idx * value_cache_stride_2
-            + offs_d[None, :] * value_cache_stride_3
-            + (seq_offset % BLOCK_SIZE)[:, None] * value_cache_stride_1
-        )
+    #     v_offset = (
+    #         physical_block_idx * value_cache_stride_0
+    #         + kv_head_idx * value_cache_stride_2
+    #         + offs_d[None, :] * value_cache_stride_3
+    #         + (seq_offset % BLOCK_SIZE)[:, None] * value_cache_stride_1
+    #     )
 
-        k_offset = (
-            physical_block_idx * key_cache_stride_0
-            + kv_head_idx * key_cache_stride_2
-            + offs_d[:, None] * key_cache_stride_3
-            + (seq_offset % BLOCK_SIZE)[None, :] * key_cache_stride_1
-        )
+    #     k_offset = (
+    #         physical_block_idx * key_cache_stride_0
+    #         + kv_head_idx * key_cache_stride_2
+    #         + offs_d[:, None] * key_cache_stride_3
+    #         + (seq_offset % BLOCK_SIZE)[None, :] * key_cache_stride_1
+    #     )
 
-        gk_offset = (
-            physical_block_idx * gate_cache_stride_0
-            + kv_head_idx * gate_cache_stride_2
-            + (seq_offset % BLOCK_SIZE) * gate_cache_stride_1
-        )
+    #     gk_offset = (
+    #         physical_block_idx * gate_cache_stride_0
+    #         + kv_head_idx * gate_cache_stride_2
+    #         + (seq_offset % BLOCK_SIZE) * gate_cache_stride_1
+    #     )
 
-        # K : (HEAD_SIZE, TILE_SIZE)
-        K = tl.load(
-            key_cache_ptr + k_offset,
-            mask=dim_mask[:, None] & tile_mask[None, :],
-            other=0.0,
-        )
+    #     # K : (HEAD_SIZE, TILE_SIZE)
+    #     K = tl.load(
+    #         key_cache_ptr + k_offset,
+    #         mask=dim_mask[:, None] & tile_mask[None, :],
+    #         other=0.0,
+    #     )
 
-        # V : (TILE_SIZE, HEAD_SIZE)
-        V = tl.load(
-            value_cache_ptr + v_offset,
-            mask=dim_mask[None, :] & tile_mask[:, None],
-            other=0.0,
-        )
+    #     # V : (TILE_SIZE, HEAD_SIZE)
+    #     V = tl.load(
+    #         value_cache_ptr + v_offset,
+    #         mask=dim_mask[None, :] & tile_mask[:, None],
+    #         other=0.0,
+    #     )
 
-        # G : (TILE_SIZE, )
-        GK = tl.load(
-            gate_cache_ptr + gk_offset,
-            mask=tile_mask,
-            other=0.0,
-        )
+    #     # G : (TILE_SIZE, )
+    #     GK = tl.load(
+    #         gate_cache_ptr + gk_offset,
+    #         mask=tile_mask,
+    #         other=0.0,
+    #     )
 
-        causal_mask = seq_offset[None, :] < query_pos[:, None] + 1
+    #     causal_mask = seq_offset[None, :] < query_pos[:, None] + 1
 
-        mask = query_mask[:, None] & causal_mask
+    #     mask = query_mask[:, None] & causal_mask
 
-        acc, L, M = attention_inner(Q, K, V, GQ, GK, mask, acc, L, M, scale, BLOCK_M, TILE_SIZE, deg)
+    #     acc, L, M = attention_inner(Q, K, V, GQ, GK, mask, acc, L, M, scale, BLOCK_M, TILE_SIZE, deg)
 
     # iterate through scheduled tiles
     for j in tl.range(scheduled_tile_start, scheduled_tile_end):
@@ -883,6 +883,11 @@ def query_cache(
         tile_mask = tl.where(seq_pos >= cache_len, 1, 0).to(tl.int1)
         tile_mask = tile_mask & tl.where(seq_pos < cache_len + query_len, 1, 0).to(tl.int1)
         kv_offset = query_token_offset + seq_pos - cache_len
+        if tl.program_id(1) == 0 and j == 0:
+            tl.device_print("kv_offset_0", kv_offset)
+
+        if tl.program_id(1) == 0 and j == 1:
+            tl.device_print("kv_offset_1", kv_offset)
 
         v_offset = (
             kv_offset[:, None] * value_stride_0
@@ -1088,6 +1093,17 @@ def unified_query_state_2d(
     # block_scheduled_len: the number of scheduled tokens in this block
     seq_idx, chunk_idx, local_block_idx, query_block_idx, query_len, query_token_offset, cache_len, chunk_cache_len, block_scheduled_len = localize_this_pid_in_chunk(cu_seqlens_q_ptr, cu_seqlens_padded_q_ptr, cache_lens_ptr, q_block_global_idx, num_seqs, BLOCK_Q, chunk_size)
 
+    if tl.program_id(0) == 32 and tl.program_id(1) == 0:
+        tl.device_print("seq_idx", seq_idx)
+        tl.device_print("chunk_idx", chunk_idx)
+        tl.device_print("local_block_idx", local_block_idx)
+        tl.device_print("query_block_idx", query_block_idx)
+        tl.device_print("query_len", query_len)
+        tl.device_print("query_token_offset", query_token_offset)
+        tl.device_print("cache_len", cache_len)
+        tl.device_print("chunk_cache_len", chunk_cache_len)
+        tl.device_print("block_scheduled_len", block_scheduled_len)
+
     # skip if there's no scheduled tokens in this block, could be due to:
     # 1. This is a padded sequence by vllm
     # 2. This block is at the start of the first chunk where it's all cached tokens
@@ -1095,6 +1111,7 @@ def unified_query_state_2d(
     if block_scheduled_len <= 0:
         return
 
+    return
     offs_m = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_SIZE)
     offs_t = tl.arange(0, TILE_SIZE)
@@ -1140,7 +1157,9 @@ def unified_query_state_2d(
 
     # scheduled tiles
     scheduled_tile_start = chunk_cache_len // TILE_SIZE
-    scheduled_tile_end = cdiv_fn(local_block_idx * BLOCK_Q, TILE_SIZE)
+    scheduled_tile_end = tl.cdiv((local_block_idx + 1) * BLOCK_Q, TILE_SIZE)
+    tl.device_print("scheduled_tile_start", scheduled_tile_start)
+    tl.device_print("scheduled_tile_end", scheduled_tile_end)
 
     # find cache block index
     last_memorized_blk_idx = tl.load(last_memorized_blk_idx_ptr + seq_idx).to(tl.int64)
@@ -1153,11 +1172,15 @@ def unified_query_state_2d(
     acc, L, M = query_cache(Q, GQ, query_pos, acc, L, M, key_ptr, value_ptr, gate_ptr, key_cache_ptr, value_cache_ptr, gate_cache_ptr, offs_t, offs_d, query_mask, dim_mask, first_cached_block_idx, query_token_offset, kv_head_idx, chunk_idx, cache_len, query_len, chunk_cache_len, cached_tile_end, scheduled_tile_start, scheduled_tile_end, scale, deg, chunk_size, BLOCK_M, TILE_SIZE, BLOCK_SIZE, key_cache_stride_0, key_cache_stride_1, key_cache_stride_2, key_cache_stride_3, value_cache_stride_0, value_cache_stride_1, value_cache_stride_2, value_cache_stride_3, gate_cache_stride_0, gate_cache_stride_1, gate_cache_stride_2, key_stride_0, key_stride_1, key_stride_2, value_stride_0, value_stride_1, value_stride_2, gate_stride_0, gate_stride_1)
 
     # Query against memory
-    if last_memorized_blk_idx >= 0: # skip if no memory yet
-        acc, L = query_memory(Q, GQ, acc, L, M, memory_ptr, ks_ptr, block_table_ptr, offs_d, scale, last_memorized_blk_idx, seq_idx, chunk_idx, kv_head_idx, d_tile, deg, state_dim, HEAD_SIZE, BLOCK_M, block_table_stride_0, memory_stride_0, memory_stride_1, memory_stride_2, memory_stride_3, ks_stride_0, ks_stride_1, ks_stride_2)
+    # if last_memorized_blk_idx >= 0: # skip if no memory yet
+    #     acc, L = query_memory(Q, GQ, acc, L, M, memory_ptr, ks_ptr, block_table_ptr, offs_d, scale, last_memorized_blk_idx, seq_idx, chunk_idx, kv_head_idx, d_tile, deg, state_dim, HEAD_SIZE, BLOCK_M, block_table_stride_0, memory_stride_0, memory_stride_1, memory_stride_2, memory_stride_3, ks_stride_0, ks_stride_1, ks_stride_2)
            
     # epilogue
     acc = acc / L[:, None]
+
+    # if seq_idx == 0 and local_block_idx == 0 and kv_head_idx == 0:
+    #     tl.device_print("acc", acc)
+    #     tl.device_print("query_offset_0", query_offset_0)
 
     output_offset = (
         query_offset_0[:, None] * output_stride_0
