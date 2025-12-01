@@ -93,6 +93,7 @@ class BrumbyRetention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
+        self.layer_idx = extract_layer_index(prefix)
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -105,7 +106,7 @@ class BrumbyRetention(nn.Module):
         )
         self.g_proj = ColumnParallelLinear(
             hidden_size,
-            self.num_kv_heads,
+            self.total_num_kv_heads,
             bias=qkv_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.g_proj",
@@ -156,7 +157,12 @@ class BrumbyRetention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         g, _ = self.g_proj(hidden_states)
         log_g = F.logsigmoid(g)
+        # torch.save(q, f"vllm_q_{self.layer_idx}.pt")
+        # torch.save(k, f"vllm_k_{self.layer_idx}.pt")
+        # torch.save(v, f"vllm_v_{self.layer_idx}.pt")
+        # torch.save(log_g, f"vllm_log_g_{self.layer_idx}.pt")
         attn_output = self.attn(q, k, v, log_g)
+        # torch.save(attn_output, f"vllm_attn_output_{self.layer_idx}.pt")
         output, _ = self.o_proj(attn_output)
         return output
 

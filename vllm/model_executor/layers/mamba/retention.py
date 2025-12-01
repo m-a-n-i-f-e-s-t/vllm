@@ -171,6 +171,7 @@ class Retention(MambaBase, CustomOp):
         key = key.view(-1, self.num_kv_heads, self.head_dim)
         value = value.view(-1, self.num_kv_heads, self.head_dim)
         gate = gate.view(-1, self.num_kv_heads)
+        output = output.view(-1, self.num_heads, self.head_dim)
         
         # Call kernel
         power_retention_varlen(

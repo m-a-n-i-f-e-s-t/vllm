@@ -733,7 +733,6 @@ def attention_inner(
     L, # [BLOCK_M]
     M, # [BLOCK_M]
     scale, # float32
-    if_print,
     BLOCK_M: tl.constexpr, # int
     TILE_SIZE: tl.constexpr, # int
     deg: tl.constexpr, # int
@@ -742,7 +741,7 @@ def attention_inner(
     # S : (BLOCK_M, TILE_SIZE)
     S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
 
-    S += scale * tl.dot(Q, K, allow_tf32=False)
+    S += scale * tl.dot(Q.to(K.dtype), K, allow_tf32=False)
 
     S = tl.log(S.abs() + 1e-7) * deg
 
@@ -883,7 +882,7 @@ def query_cache(
 
         mask = query_mask[:, None] & causal_mask
 
-        acc, L, M = attention_inner(Q, K, V, GQ, GK, mask, acc, L, M, scale, False, BLOCK_M, TILE_SIZE, deg)
+        acc, L, M = attention_inner(Q, K, V, GQ, GK, mask, acc, L, M, scale, BLOCK_M, TILE_SIZE, deg)
 
     # iterate through scheduled tiles
     for j in tl.range(scheduled_tile_start, scheduled_tile_end):
@@ -932,15 +931,9 @@ def query_cache(
 
         causal_mask = seq_pos[None, :] < query_pos[:, None] + 1
 
-        if tl.program_id(0) == 16 and tl.program_id(1) == 1 and j == 1:
-            # print("query_mask:", query_mask)
-            if_print = False
-        else:
-            if_print = False
-
         mask = query_mask[:, None] & causal_mask
 
-        acc, L, M = attention_inner(Q, K, V, GQ, GK, mask, acc, L, M, scale, if_print, BLOCK_M, TILE_SIZE, deg)
+        acc, L, M = attention_inner(Q, K, V, GQ, GK, mask, acc, L, M, scale, BLOCK_M, TILE_SIZE, deg)
 
     return acc, L, M
 
