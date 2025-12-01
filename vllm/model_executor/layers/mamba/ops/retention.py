@@ -352,7 +352,6 @@ def block_sympow_k_mma(
     s, # [d_tile**2]
     acc, # [M, N]
     l, # [M]
-    scale, # [M]
     M: tl.constexpr, # int
     dim: tl.constexpr, # int
     power: tl.constexpr, # int
@@ -367,11 +366,10 @@ def block_sympow_k_mma(
     x2_range = tile_idx_1 * d_tile + d_tile_range
     x1 = slice_read_2d(x, 1, x1_range, M, dim, d_tile) # [M, d_tile]
     x2 = slice_read_2d(x, 1, x2_range, M, dim, d_tile) # [M, d_tile]
-
     x1_x2 = x1[:, :, None] * x2[:, None, :] # [M, d_tile, d_tile]
-    phi_x = x1_x2.reshape(M, d_tile*d_tile).to(y.dtype) # [M, d_tile**2]
-    acc = tl.dot(phi_x, y, allow_tf32=False) * scale[:, None] + acc # [M, N]
-    l = tl.sum(phi_x * s[None, :], axis=1) * scale + l # [M]
+    phi_x = x1_x2.reshape(M, d_tile*d_tile) # [M, d_tile**2]
+    acc = tl.dot(phi_x.to(y.dtype), y, acc, allow_tf32=False) # [M, N]
+    l = tl.sum(phi_x * s[None, :], axis=1) + l # [M]
     return acc, l
 
 
@@ -754,9 +752,6 @@ def attention_inner(
     # P : (BLOCK_M, TILE_SIZE)
     P = tl.exp(S - m_j[:, None])
 
-    # if if_print:
-    #     tl.device_print("P", P)
-
     # l_j : (BLOCK_M,)
     l_j = tl.sum(P, axis=1)
 
@@ -983,21 +978,25 @@ def query_memory(
 ):
     # scale down attention output for numerical stability
     alpha = tl.maximum(tl.sqrt(state_dim), tl.exp(M)) # [BLOCK_M]
-    adj_attn = tl.exp(M) / alpha # [BLOCK_M]
-    acc = acc * adj_attn[:, None]
-    L = L * adj_attn
+    scale_cache = tl.exp(M) / alpha # [BLOCK_M]
+    scale_mem = _power(scale, deg) / alpha # [BLOCK_M]
+    adj = scale_cache / scale_mem
+    acc = acc * adj[:, None]
+    L = L * adj
     # query memory
     memory_block_idx = tl.load(block_table_ptr + seq_idx * block_table_stride_0 + last_memorized_blk_idx + chunk_idx).to(tl.int64)
     BLOCK_S: tl.constexpr = d_tile ** deg
     offs_s = tl.arange(0, BLOCK_S)
-    scale_mem = _power(scale, deg) / alpha # [BLOCK_M]
     Q = discount_query(Q, GQ, deg)
+    state_offset = offs_s
     for dtile_0 in tl.range(0, HEAD_SIZE // d_tile):
-        for dtile_1 in tl.range(d_tile, HEAD_SIZE // d_tile):
-            state_offset = dtile_0 * HEAD_SIZE * d_tile + dtile_1 * d_tile * d_tile + offs_s
+        for dtile_1 in tl.range(dtile_0, HEAD_SIZE // d_tile):
             memory = tl.load(memory_ptr + memory_block_idx * memory_stride_0 + kv_head_idx * memory_stride_1 + state_offset[:, None] * memory_stride_2 + offs_d[None, :] * memory_stride_3)
             ks = tl.load(ks_ptr + memory_block_idx * ks_stride_0 + kv_head_idx * ks_stride_1 + state_offset * ks_stride_2)
-            acc, L = block_sympow_k_mma(Q, memory, ks, acc, L, scale_mem, BLOCK_M, HEAD_SIZE, deg, d_tile, dtile_0, dtile_1)
+            acc, L = block_sympow_k_mma(Q, memory, ks, acc, L, BLOCK_M, HEAD_SIZE, deg, d_tile, dtile_0, dtile_1)
+            state_offset = state_offset + d_tile * d_tile
+    acc = acc * scale_mem[:, None]
+    L = L * scale_mem
     return acc, L
 
 

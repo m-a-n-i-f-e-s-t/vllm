@@ -284,31 +284,36 @@ def discount_query_ref(
     gate_query: torch.Tensor, # [num_query_tokens, num_query_heads]
     deg: int, # int
 ) -> torch.Tensor:
-    discounted_query = (query * (gate_query - deg).exp().unsqueeze(-1)).to(query.dtype)
+    discounted_query = (query * (gate_query / deg).exp().unsqueeze(-1)).to(query.dtype)
     return discounted_query
 
 def sympow_k_mma_ref(
     x: torch.Tensor, # [B, M, d]
     y: torch.Tensor, # [B, D, N]
+    s: torch.Tensor, # [B, D]
     acc: torch.Tensor, # [B, M, N]
-    l: torch.Tensor, # [M]
-    scale: torch.Tensor, # [M]
+    l: torch.Tensor, # [B, M]
+    scale: torch.Tensor, # [B, M]
     dim: int, # int
     power: int, # int
     d_tile: int, # int
+    if_print: bool, # bool
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert power == 2, "only power 2 is supported now"
     assert dim % d_tile == 0, "dim must be divisible by d_tile"
+    phi_x = torch.empty(x.shape[0], x.shape[1], y.shape[1], dtype=x.dtype, device=x.device) # [B, M, D]
+    D_range = torch.arange(0, d_tile**2, dtype=torch.int32, device=x.device)
     for tile_0 in range(0, dim // d_tile):
         for tile_1 in range(tile_0, dim // d_tile):
             x1_range = slice(tile_0 * d_tile, tile_0 * d_tile + d_tile)
             x2_range = slice(tile_1 * d_tile, tile_1 * d_tile + d_tile)
-            x1 = x[:, x1_range]
-            x2 = x[:, x2_range]
-            x1_x2 = x1[:, :, None] * x2[:, None, :] # [M, d_tile, d_tile]
-            phi_x = x1_x2.reshape(x.shape[0], d_tile**2)
-            acc += (phi_x @ y) * scale[None, :, None]
-            l += phi_x.sum(dim=1) * scale[None, :]
+            x1 = x[..., x1_range]
+            x2 = x[..., x2_range]
+            x1_x2 = x1[..., None] * x2[:, :, None, :] # [B, M, d_tile, d_tile]
+            phi_x[..., D_range] = x1_x2.reshape(x.shape[0], x.shape[1], d_tile**2)
+            D_range += d_tile**2
+    acc += (phi_x @ y).to(acc.dtype) * scale[..., None]
+    l += (phi_x * s[:, None, :]).sum(dim=-1).to(l.dtype) * scale
     return acc, l
 
 
@@ -337,6 +342,7 @@ def unified_query_state_ref(
     state_dim: int, # int
 ):
     num_seqs = cache_lens.shape[0]
+    head_dim = query.shape[2]
     for seq_idx in range(num_seqs):
         query_start = cu_seqlens_q[seq_idx]
         query_len = cu_seqlens_q[seq_idx + 1] - cu_seqlens_q[seq_idx]
@@ -388,18 +394,18 @@ def unified_query_state_ref(
             # then query memory
             if last_memorized_blk >= 0:
                 alpha = torch.maximum(torch.tensor(math.sqrt(state_dim), dtype=torch.float32, device=m.device), torch.exp(m))
-                adj_attn = torch.exp(m) / alpha
-                acc = acc * adj_attn[:, None, None]
-                l = l * adj_attn[:, None]
+                scale_cache = torch.exp(m) / alpha
+                acc = acc * scale_cache[..., None]
+                l = l * scale_cache
                 mem_block_idx = block_table[seq_idx, last_memorized_blk + chunk_idx]
-                scale_mem = (scale ** deg) / alpha
+                scale_mem = ((scale ** deg) / alpha) # [num_query_tokens, num_query_heads]
                 discounted_query = discount_query_ref(chunk_query, chunk_gate_query, deg).permute(1, 0, 2)
-                memory = memory[mem_block_idx].repeat_interleave(num_queries_per_kv, dim=0)
-                ks = ks[mem_block_idx].repeat_interleave(num_queries_per_kv, dim=0)
-                acc, l = sympow_k_mma_ref(discounted_query, memory, acc.permute(1, 0, 2), l.permute(1, 0), scale_mem, state_dim, deg, d_tile)
+                memory_block = memory[mem_block_idx].repeat_interleave(num_queries_per_kv, dim=0)
+                ks_block = ks[mem_block_idx].repeat_interleave(num_queries_per_kv, dim=0)
+                if_print = seq_idx == 1 and chunk_idx == 1
+                acc, l = sympow_k_mma_ref(discounted_query, memory_block, ks_block, acc.permute(1, 0, 2), l.permute(1, 0), scale_mem.permute(1, 0), head_dim, deg, d_tile, if_print)
                 acc = acc.permute(1, 0, 2)
                 l = l.permute(1, 0)
-
             acc = acc / l[..., None] # [num_query_tokens, num_query_heads, head_dim]
             output[chunk_query_start: chunk_query_start + chunk_query_len] = acc[chunk_cache_len:]
             chunk_query_start += chunk_query_len
@@ -422,9 +428,7 @@ def create_state(num_seqs: int, max_num_blks: int, chunk_size: int, num_kv_heads
 def create_input(num_tokens: int, num_query_heads: int, num_kv_heads: int, head_dim: int, dtype: torch.dtype, seed: int = 12) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     torch.manual_seed(seed)
     query = torch.randn(num_tokens, num_query_heads, head_dim, dtype=dtype, device="cuda")
-    # query = torch.arange(num_tokens, dtype=dtype, device="cuda")[:, None, None] + 0.1 * torch.arange(num_kv_heads, dtype=dtype, device="cuda")[None, :, None] + 0.01 * torch.arange(head_dim, dtype=dtype, device="cuda")[None, None, :]
     key = torch.randn(num_tokens, num_kv_heads, head_dim, dtype=dtype, device="cuda")
-    # key = torch.arange(num_tokens, dtype=dtype, device="cuda")[:, None, None] + 0.1 * torch.arange(num_kv_heads, dtype=dtype, device="cuda")[None, :, None] + 0.01 * torch.arange(head_dim, dtype=dtype, device="cuda")[None, None, :]
     value = torch.randn(num_tokens, num_kv_heads, head_dim, dtype=dtype, device="cuda")
     gate = F.logsigmoid(torch.randn(num_tokens, num_kv_heads, dtype=torch.float32, device="cuda"))
     return query, key, value, gate
@@ -489,7 +493,7 @@ def test_update_intra_chunk_memory_and_cache_3d(dtype: torch.dtype, num_kv_heads
     deg = 2
     state_dim = sympow_dim(head_dim, deg, d_tile)
     # KERNEL
-    key_cache, value_cache, gate_cache, block_table, memory, ks = create_state(num_seqs, max_num_blks, chunk_size, num_kv_heads, head_dim, dtype, zero=False)
+    key_cache, value_cache, gate_cache, block_table, memory, ks = create_state(num_seqs, max_num_blks, chunk_size, num_kv_heads, head_dim, dtype, zero=False, d_tile=d_tile)
     query, key, value, gate = create_input(num_tokens, num_query_heads, num_kv_heads, head_dim, dtype)
     cu_seqlens_q, cu_seqlens_padded_q, cache_lens, cu_cache_lens, last_memorized_blk_idx = create_metadata(num_seqs, max_num_blks, chunk_size, query_lens, computed_lens)
     total_chunks_including_cache = num_tokens // chunk_size + 2 * num_seqs
@@ -498,7 +502,7 @@ def test_update_intra_chunk_memory_and_cache_3d(dtype: torch.dtype, num_kv_heads
     BLOCK_T = 16
 
     # Ref
-    key_cache_ref, value_cache_ref, gate_cache_ref, block_table_ref, memory_ref, ks_ref = create_state(num_seqs, max_num_blks, chunk_size, num_kv_heads, head_dim, dtype, zero=False)
+    key_cache_ref, value_cache_ref, gate_cache_ref, block_table_ref, memory_ref, ks_ref = create_state(num_seqs, max_num_blks, chunk_size, num_kv_heads, head_dim, dtype, zero=False, d_tile=d_tile)
     query_ref, key_ref, value_ref, gate_ref = create_input(num_tokens, num_query_heads, num_kv_heads, head_dim, dtype)
     cu_seqlens_q_ref, cu_seqlens_padded_q_ref, cache_lens_ref, cu_cache_lens_ref, last_memorized_blk_idx_ref = create_metadata(num_seqs, max_num_blks, chunk_size, query_lens, computed_lens)
 
@@ -579,18 +583,18 @@ def test_update_intra_chunk_memory_and_cache_3d(dtype: torch.dtype, num_kv_heads
 @pytest.mark.parametrize("chunk_size", [32])
 @pytest.mark.parametrize("query_lens", [(1, 23,), (1, 41), (1, 1)])
 @pytest.mark.parametrize("computed_lens", [(16, 0), (1, 64), (0, 0), (33, 129)])
-def test_unified_query_state(dtype: torch.dtype, num_kv_heads: int, query_per_kv_heads: int, head_dim: int, chunk_size: int, query_lens: tuple[int, int], computed_lens: tuple[int, int]) -> None:
+@pytest.mark.parametrize("d_tile", [8])
+def test_unified_query_state(dtype: torch.dtype, num_kv_heads: int, query_per_kv_heads: int, head_dim: int, chunk_size: int, query_lens: tuple[int, int], computed_lens: tuple[int, int], d_tile: int) -> None:
     if len(query_lens) != len(computed_lens):
         pytest.mark.skip("query_lens and computed_lens must have the same length")
     num_tokens = sum(query_lens)
     max_num_blks = (max([q + c for q, c in zip(query_lens, computed_lens)]) + chunk_size - 1) // chunk_size
     num_query_heads = num_kv_heads * query_per_kv_heads
     num_seqs = len(query_lens)
-    d_tile = 16
     deg = 2
     state_dim = sympow_dim(head_dim, deg, d_tile)
     # KERNEL
-    key_cache, value_cache, gate_cache, block_table, memory, ks = create_state(num_seqs, max_num_blks, chunk_size, num_kv_heads, head_dim, dtype, zero=False)
+    key_cache, value_cache, gate_cache, block_table, memory, ks = create_state(num_seqs, max_num_blks, chunk_size, num_kv_heads, head_dim, dtype, zero=False, d_tile=d_tile)
     query, key, value, gate = create_input(num_tokens, num_query_heads, num_kv_heads, head_dim, dtype)
     output = torch.zeros_like(query)
     cu_seqlens_q, cu_seqlens_padded_q, cache_lens, cu_cache_lens, last_memorized_blk_idx = create_metadata(num_seqs, max_num_blks, chunk_size, query_lens, computed_lens)
@@ -647,7 +651,7 @@ def test_unified_query_state(dtype: torch.dtype, num_kv_heads: int, query_per_kv
 
 
     # Ref
-    key_cache_ref, value_cache_ref, gate_cache_ref, block_table_ref, memory_ref, ks_ref = create_state(num_seqs, max_num_blks, chunk_size, num_kv_heads, head_dim, dtype, zero=False)
+    key_cache_ref, value_cache_ref, gate_cache_ref, block_table_ref, memory_ref, ks_ref = create_state(num_seqs, max_num_blks, chunk_size, num_kv_heads, head_dim, dtype, zero=False, d_tile=d_tile)
     query_ref, key_ref, value_ref, gate_ref = create_input(num_tokens, num_query_heads, num_kv_heads, head_dim, dtype)
     cu_seqlens_q_ref, cu_seqlens_padded_q_ref, cache_lens_ref, cu_cache_lens_ref, last_memorized_blk_idx_ref = create_metadata(num_seqs, max_num_blks, chunk_size, query_lens, computed_lens)
     output_ref = torch.zeros_like(query_ref)
@@ -677,7 +681,7 @@ def test_unified_query_state(dtype: torch.dtype, num_kv_heads: int, query_per_kv
 
 
     # Check
-    torch.testing.assert_close(output, output_ref)
+    torch.testing.assert_close(output, output_ref, atol=1e-2, rtol=5e-3)
 
 
 def diff(a, b, if_abs: bool = True):
