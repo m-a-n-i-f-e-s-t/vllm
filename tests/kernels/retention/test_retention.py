@@ -411,6 +411,58 @@ def unified_query_state_ref(
             chunk_query_start += chunk_query_len
 
 
+def query_state_ref(
+    output: torch.Tensor, # [num_tokens, num_query_heads, head_dim]
+    query: torch.Tensor, # [num_tokens, num_query_heads, head_dim]
+    key: torch.Tensor, # [num_tokens, num_kv_heads, head_dim]
+    value: torch.Tensor, # [num_tokens, num_kv_heads, head_dim]
+    gate: torch.Tensor, # [num_tokens, num_key_heads]
+    key_cache: torch.Tensor, # [num_blocks, chunk_size, num_kv_heads, head_dim]
+    value_cache: torch.Tensor, # [num_blocks, chunk_size, num_kv_heads, head_dim]
+    gate_cache: torch.Tensor, # [num_blocks, chunk_size, num_kv_heads]
+    memory: torch.Tensor, # [num_blks, num_kv_heads, state_dim, head_dim]
+    ks: torch.Tensor, # [num_blks, num_kv_heads, state_dim]
+    block_table: torch.Tensor, # [num_reqs, max_num_blocks_per_req]
+    cu_seqlens_q: torch.Tensor, # [num_reqs + 1]
+    cu_seqlens_padded_q: torch.Tensor, # [num_reqs + 1]
+    seq_lens: torch.Tensor, # [num_reqs]
+    cache_lens: torch.Tensor, # [num_reqs]
+    last_memorized_blk_idx: torch.Tensor, # [num_reqs]
+    scale: float, # float
+    d_tile: int, # int
+    deg: int, # int
+):
+    num_query_heads = query.shape[1]
+    num_kv_heads = key.shape[1]
+    num_queries_per_kv = num_query_heads // num_kv_heads
+    chunk_size = key_cache.shape[1]
+    state_dim = memory.shape[2]
+    unified_query_state_ref(
+    output,
+    query,
+    key,
+    value,
+    gate,
+    key_cache,
+    value_cache,
+    gate_cache,
+    memory,
+    ks,
+    block_table,
+    last_memorized_blk_idx,
+    cu_seqlens_q,
+    cu_seqlens_padded_q,
+    cache_lens,
+    scale,
+    num_query_heads,
+    num_queries_per_kv,
+    d_tile,
+    deg,
+    chunk_size,
+    state_dim)
+
+
+
 def create_state(num_seqs: int, max_num_blks: int, chunk_size: int, num_kv_heads: int, head_dim: int, dtype: torch.dtype, zero: bool = True, seed: int = 42, d_tile: int = 16) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     fn = torch.zeros if zero else torch.randn
     torch.manual_seed(seed)
@@ -599,15 +651,7 @@ def test_unified_query_state(dtype: torch.dtype, num_kv_heads: int, query_per_kv
     query, key, value, gate = create_input(num_tokens, num_query_heads, num_kv_heads, head_dim, dtype)
     output = torch.zeros_like(query)
     cu_seqlens_q, cu_seqlens_padded_q, cache_lens, cu_cache_lens, last_memorized_blk_idx, seq_lens = create_metadata(num_seqs, max_num_blks, chunk_size, query_lens, computed_lens)
-
-    BLOCK_Q, BLOCK_M = find_block_sizes(chunk_size, query_per_kv_heads)
-    total_q_blocks = num_tokens // BLOCK_Q + 2 * num_seqs * (chunk_size // BLOCK_Q)
-    TILE_SIZE = 16
-    BLOCK_SIZE = chunk_size
-
-    print(f"f{BLOCK_Q=}, {BLOCK_M=}")
-    print(f"f{total_q_blocks=}, {num_kv_heads=}, {query_per_kv_heads=}")
-    unified_query_state_2d[(total_q_blocks, num_kv_heads)](
+    query_state(
         output,
         query,
         key,
@@ -619,35 +663,14 @@ def test_unified_query_state(dtype: torch.dtype, num_kv_heads: int, query_per_kv
         memory,
         ks,
         block_table,
-        last_memorized_blk_idx,
         cu_seqlens_q,
         cu_seqlens_padded_q,
+        seq_lens,
         cache_lens,
+        last_memorized_blk_idx,
         float(head_dim)**-0.5,
-        num_query_heads,
-        query_per_kv_heads,
-        BLOCK_SIZE,
-        TILE_SIZE,
-        head_dim,
-        BLOCK_Q,
-        num_seqs,
         d_tile,
-        BLOCK_M,
         deg,
-        chunk_size,
-        float(state_dim),
-        output.stride(0),
-        output.stride(1),
-        *query.stride(),
-        *key.stride(),
-        *value.stride(),
-        *gate.stride(),
-        *key_cache.stride(),
-        *value_cache.stride(),
-        *gate_cache.stride(),
-        *memory.stride(),
-        *ks.stride(),
-        *block_table.stride(),
     )
 
 
@@ -656,7 +679,7 @@ def test_unified_query_state(dtype: torch.dtype, num_kv_heads: int, query_per_kv
     query_ref, key_ref, value_ref, gate_ref = create_input(num_tokens, num_query_heads, num_kv_heads, head_dim, dtype)
     cu_seqlens_q_ref, cu_seqlens_padded_q_ref, cache_lens_ref, cu_cache_lens_ref, last_memorized_blk_idx_ref, seq_lens_ref = create_metadata(num_seqs, max_num_blks, chunk_size, query_lens, computed_lens)
     output_ref = torch.zeros_like(query_ref)
-    unified_query_state_ref(
+    query_state_ref(
         output_ref,
         query_ref,
         key_ref,
@@ -668,18 +691,15 @@ def test_unified_query_state(dtype: torch.dtype, num_kv_heads: int, query_per_kv
         memory_ref,
         ks_ref,
         block_table_ref,
-        last_memorized_blk_idx_ref,
         cu_seqlens_q_ref,
         cu_seqlens_padded_q_ref,
+        seq_lens_ref,
         cache_lens_ref,
+        last_memorized_blk_idx_ref,
         float(head_dim)**-0.5,
-        num_query_heads,
-        query_per_kv_heads,
         d_tile,
         deg,
-        chunk_size,
-        state_dim)
-
+    )
 
     # Check
     torch.testing.assert_close(output, output_ref, atol=1e-2, rtol=5e-3)

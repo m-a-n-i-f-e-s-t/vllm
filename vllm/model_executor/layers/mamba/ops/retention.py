@@ -1246,7 +1246,7 @@ def query_state(
     num_query_heads = query.shape[1]
     num_kv_heads, head_dim = key.shape[1], key.shape[2]
     num_queries_per_kv = num_query_heads // num_kv_heads
-    chunk_size = key_cache.shape[2]
+    chunk_size = key_cache.shape[1]
     state_dim = memory.shape[2]
 
     BLOCK_Q, BLOCK_M = find_block_sizes(chunk_size, num_queries_per_kv)
@@ -1269,7 +1269,7 @@ def query_state(
     #  <= (num_tokens // chunk_size + num_seqs) * (chunk_size // BLOCK_Q) + num_seqs * (chunk_size // BLOCK_Q)
     #  = num_tokens // BLOCK_Q + 2 * num_seqs * (chunk_size // BLOCK_Q)
     total_q_blocks = num_tokens // BLOCK_Q + 2 * num_seqs * (chunk_size // BLOCK_Q)
-    TILE_SIZE = 32
+    TILE_SIZE = 16
     BLOCK_SIZE = chunk_size
 
     unified_query_state_2d[(total_q_blocks, num_kv_heads)](
@@ -1301,7 +1301,8 @@ def query_state(
         deg,
         chunk_size,
         float(state_dim),
-        *output.stride(),
+        output.stride(0),
+        output.stride(1),
         *query.stride(),
         *key.stride(),
         *value.stride(),
