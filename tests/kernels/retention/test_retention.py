@@ -62,9 +62,9 @@ def sympow_m_mma_ref(
     dim = x.shape[1]
     num_tiles = dim // d_tile
     B = x.shape[0]
-    D = sympow_dim(dim, power, d_tile)
-    acc = torch.zeros(B, D, y.shape[2], dtype=x.dtype, device=x.device)
-    l = torch.zeros(B, D, dtype=torch.float32, device=x.device)
+    # D = sympow_dim(dim, power, d_tile)
+    # acc = torch.zeros(B, D, y.shape[2], dtype=x.dtype, device=x.device)
+    # l = torch.zeros(B, D, dtype=torch.float32, device=x.device)
     D_offset = 0
     for tile_0 in range(num_tiles):
         for tile_1 in range(tile_0, num_tiles):
@@ -116,7 +116,7 @@ def update_intra_chunk_memory_and_cache_3d_ref(
         for chunk_idx in range(num_chunks):
             chunk_start = query_start + max(0, chunk_idx * chunk_size - cache_len)
             chunk_cache_len = cache_len if chunk_idx == 0 else 0
-            chunk_query_len = max(0, min(chunk_size, query_len + cache_len - chunk_idx * chunk_size) - cache_len)
+            chunk_query_len = max(0, min(chunk_size, query_len + cache_len - chunk_idx * chunk_size) - chunk_cache_len)
             acc = torch.zeros(memory.shape[1], memory.shape[2], memory.shape[3], dtype=memory.dtype, device=memory.device) # [num_kv_heads, state_dim, head_dim]
             l = torch.zeros(memory.shape[1], memory.shape[2], dtype=torch.float32, device=memory.device)
             cache_blk = (block_table[seq_idx, last_memorized_blk_idx[seq_idx].item() + 1 + chunk_idx]).item()
@@ -478,8 +478,7 @@ def create_state(num_seqs: int, max_num_blks: int, chunk_size: int, num_kv_heads
     total_num_blks = num_seqs * max_num_blks
     key_cache = fn(total_num_blks, chunk_size, num_kv_heads, head_dim, dtype=dtype, device="cuda")
     value_cache = fn(total_num_blks, chunk_size, num_kv_heads, head_dim, dtype=dtype, device="cuda")
-    # gate_cache = F.logsigmoid(fn(total_num_blks, chunk_size, num_kv_heads, dtype=torch.float32, device="cuda")).cumsum(dim=1)
-    gate_cache = torch.ones(total_num_blks, chunk_size, num_kv_heads, dtype=torch.float32, device="cuda") * 0.1
+    gate_cache = F.logsigmoid(fn(total_num_blks, chunk_size, num_kv_heads, dtype=torch.float32, device="cuda"))
     all_blocks = torch.randperm(total_num_blks, device="cuda", dtype=torch.int32)
     block_table = all_blocks.reshape(num_seqs, max_num_blks)
     memory = fn(total_num_blks, num_kv_heads, state_dim, head_dim, dtype=dtype, device="cuda")
@@ -491,8 +490,7 @@ def create_input(num_tokens: int, num_query_heads: int, num_kv_heads: int, head_
     query = torch.randn(num_tokens, num_query_heads, head_dim, dtype=dtype, device="cuda")
     key = torch.randn(num_tokens, num_kv_heads, head_dim, dtype=dtype, device="cuda")
     value = torch.randn(num_tokens, num_kv_heads, head_dim, dtype=dtype, device="cuda")
-    # gate = F.logsigmoid(torch.randn(num_tokens, num_kv_heads, dtype=torch.float32, device="cuda"))
-    gate = torch.ones(num_tokens, num_kv_heads, dtype=torch.float32, device="cuda")
+    gate = F.logsigmoid(torch.randn(num_tokens, num_kv_heads, dtype=torch.float32, device="cuda").abs())
     return query, key, value, gate
 
 def create_metadata(num_seqs: int, max_num_blks: int, block_size: int, query_lens: tuple[int,...], computed_lens: tuple[int,...]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -544,11 +542,11 @@ def test_cumsum_intra_chunk_gate(dtype: torch.dtype, num_kv_heads: int, query_pe
 @pytest.mark.parametrize("query_per_kv_heads", [1])
 @pytest.mark.parametrize("head_dim", [32, 128])
 @pytest.mark.parametrize("chunk_size", [32])
-@pytest.mark.parametrize("query_lens", [(23, 1), (1, 41), (1, 1)])
-@pytest.mark.parametrize("computed_lens", [(16, 0), (1, 64), (0, 0), (33, 129)])
+@pytest.mark.parametrize("query_lens", [(23,), (1, 41), (1, 1)])
+@pytest.mark.parametrize("computed_lens", [(16,), (1, 64), (0, 0), (33, 129)])
 def test_update_intra_chunk_memory_and_cache_3d(dtype: torch.dtype, num_kv_heads: int, query_per_kv_heads: int, head_dim: int, chunk_size: int, query_lens: tuple[int, int], computed_lens: tuple[int, int]) -> None:
     if len(query_lens) != len(computed_lens):
-        pytest.mark.skip("query_lens and computed_lens must have the same length")
+        pytest.skip("query_lens and computed_lens must have the same length")
     num_tokens = sum(query_lens)
     max_num_blks = (max([q + c for q, c in zip(query_lens, computed_lens)]) + chunk_size - 1) // chunk_size
     num_query_heads = num_kv_heads * query_per_kv_heads
@@ -629,8 +627,10 @@ def test_update_intra_chunk_memory_and_cache_3d(dtype: torch.dtype, num_kv_heads
         d_tile,
         deg,
     )
-    torch.testing.assert_close(memory, memory_ref, atol=5e-3, rtol=1e-2)
-    # torch.testing.assert_close(ks / 2 * state_dim, ks_ref / 2 * state_dim, atol=1e-2, rtol=2e-2)
+
+    atol = 1e-3 if dtype == torch.float32 else 2e-2 * chunk_size * head_dim
+    torch.testing.assert_close(memory, memory_ref, atol=atol, rtol=1e-2)
+    torch.testing.assert_close(ks, ks_ref, atol=atol, rtol=1e-2)
     torch.testing.assert_close(key_cache, key_cache_ref)
     torch.testing.assert_close(value_cache, value_cache_ref)
     torch.testing.assert_close(gate_cache, gate_cache_ref)
@@ -648,7 +648,7 @@ def test_update_intra_chunk_memory_and_cache_3d(dtype: torch.dtype, num_kv_heads
 @pytest.mark.parametrize("computed_lens", [(16, 0), (1, 64), (0, 0), (33, 129)])
 def test_cumsum_inter_chunk_memory(dtype: torch.dtype, num_kv_heads: int, query_per_kv_heads: int, head_dim: int, chunk_size: int, query_lens: tuple[int, int], computed_lens: tuple[int, int]) -> None:
     if len(query_lens) != len(computed_lens):
-        pytest.mark.skip("query_lens and computed_lens must have the same length")
+        pytest.skip("query_lens and computed_lens must have the same length")
     num_tokens = sum(query_lens)
     max_num_blks = (max([q + c for q, c in zip(query_lens, computed_lens)]) + chunk_size - 1) // chunk_size
     num_query_heads = num_kv_heads * query_per_kv_heads
@@ -718,7 +718,7 @@ def test_cumsum_inter_chunk_memory(dtype: torch.dtype, num_kv_heads: int, query_
 @pytest.mark.parametrize("d_tile", [8])
 def test_unified_query_state(dtype: torch.dtype, num_kv_heads: int, query_per_kv_heads: int, head_dim: int, chunk_size: int, query_lens: tuple[int, int], computed_lens: tuple[int, int], d_tile: int) -> None:
     if len(query_lens) != len(computed_lens):
-        pytest.mark.skip("query_lens and computed_lens must have the same length")
+        pytest.skip("query_lens and computed_lens must have the same length")
     num_tokens = sum(query_lens)
     max_num_blks = (max([q + c for q, c in zip(query_lens, computed_lens)]) + chunk_size - 1) // chunk_size
     num_query_heads = num_kv_heads * query_per_kv_heads

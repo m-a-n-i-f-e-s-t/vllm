@@ -531,14 +531,14 @@ def update_intra_chunk_memory_and_cache_3d(
     
     # assign all cached tokens to first chunk
     local_cache_len = tl.minimum(cache_len, tl.maximum(0, chunk_size - local_chunk_idx * chunk_size))
-    query_offset = tl.maximum(0, local_chunk_idx * chunk_size - cache_len)
-
-    key_ptr = key_ptr + (query_start_idx + query_offset).to(tl.int64) * key_stride_0 + head_idx * key_stride_1
-    value_ptr = value_ptr + (query_start_idx + query_offset).to(tl.int64) * value_stride_0 + head_idx * value_stride_1
-    gate_ptr = gate_ptr + (query_start_idx + query_offset).to(tl.int64) * gate_stride_0 + head_idx * gate_stride_1
+    local_query_start = (query_start_idx + tl.maximum(0, local_chunk_idx * chunk_size - cache_len)).to(tl.int64)
 
     # the number of scheduled tokens this CTA needs to handle
-    local_schedule_len = tl.minimum(cache_len + scheduled_len - local_chunk_idx * chunk_size, chunk_size) - cache_len
+    local_schedule_len = tl.minimum(cache_len + scheduled_len - local_chunk_idx * chunk_size, chunk_size) - local_cache_len
+
+    key_ptr = key_ptr + local_query_start * key_stride_0 + head_idx * key_stride_1
+    value_ptr = value_ptr + local_query_start * value_stride_0 + head_idx * value_stride_1
+    gate_ptr = gate_ptr + local_query_start * gate_stride_0 + head_idx * gate_stride_1
 
     # handle cached tokens
     # update memory if cached tokens + scheduled tokens fills a chunk
@@ -558,7 +558,7 @@ def update_intra_chunk_memory_and_cache_3d(
     if local_cache_len + local_schedule_len == chunk_size:
         for tid in tl.range(0, tl.cdiv(local_schedule_len, BLOCK_T)):
             range_t = tl.arange(0, BLOCK_T) + tid * BLOCK_T
-            mask_t = range_t < local_schedule_len
+            mask_t = (range_t < local_schedule_len)
             keys = tl.load(key_ptr + range_t[None, :] * key_stride_0 + range_dim[:, None] * key_stride_2, mask=mask_t[None, :], other=0)
             values = tl.load(value_ptr + range_t[:, None] * value_stride_0 + range_dim[None, :] * value_stride_2, mask=mask_t[:, None], other=0)
             gates = tl.load(gate_ptr + range_t * gate_stride_0, mask=mask_t, other=0)
