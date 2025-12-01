@@ -443,7 +443,8 @@ def create_metadata(num_seqs: int, max_num_blks: int, block_size: int, query_len
     non_memorized_lens =cache_lens_tensor + query_lens_tensor
     padded_lens = ((non_memorized_lens + block_size - 1) // block_size) * block_size
     cu_seqlens_padded_q = F.pad(torch.cumsum(padded_lens, dim=0), (1, 0))
-    return cu_seqlens_q, cu_seqlens_padded_q, cache_lens_tensor, cu_cache_lens, last_memorized_blk_idx
+    seq_lens = query_lens_tensor + computed_lens_tensor
+    return cu_seqlens_q, cu_seqlens_padded_q, cache_lens_tensor, cu_cache_lens, last_memorized_blk_idx, seq_lens
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -460,12 +461,12 @@ def test_cumsum_intra_chunk_gate(dtype: torch.dtype, num_kv_heads: int, query_pe
     num_seqs = len(query_lens)
     key_cache, value_cache, gate_cache, block_table, memory, ks = create_state(num_seqs, max_num_blks, chunk_size, num_kv_heads, head_dim, dtype, zero=False)
     query, key, value, gate = create_input(num_tokens, num_query_heads, num_kv_heads, head_dim, dtype)
-    cu_seqlens_q, cu_seqlens_padded_q, cache_lens, cu_cache_lens, last_memorized_blk_idx = create_metadata(num_seqs, max_num_blks, chunk_size, query_lens, computed_lens)
+    cu_seqlens_q, cu_seqlens_padded_q, cache_lens, cu_cache_lens, last_memorized_blk_idx, seq_lens = create_metadata(num_seqs, max_num_blks, chunk_size, query_lens, computed_lens)
     total_chunks = num_tokens // chunk_size + num_seqs
     
     key_cache_ref, value_cache_ref, gate_cache_ref, block_table_ref, memory_ref, ks_ref = create_state(num_seqs, max_num_blks, chunk_size, num_kv_heads, head_dim, dtype, zero=False)
     query_ref, key_ref, value_ref, gate_ref = create_input(num_tokens, num_query_heads, num_kv_heads, head_dim, dtype)
-    cu_seqlens_q_ref, cu_seqlens_padded_q_ref, cache_lens_ref, cu_cache_lens_ref, last_memorized_blk_idx_ref = create_metadata(num_seqs, max_num_blks, chunk_size, query_lens, computed_lens)
+    cu_seqlens_q_ref, cu_seqlens_padded_q_ref, cache_lens_ref, cu_cache_lens_ref, last_memorized_blk_idx_ref, seq_lens_ref = create_metadata(num_seqs, max_num_blks, chunk_size, query_lens, computed_lens)
 
     torch.testing.assert_close(gate, gate_ref)
     torch.testing.assert_close(gate_cache, gate_cache_ref)
@@ -495,7 +496,7 @@ def test_update_intra_chunk_memory_and_cache_3d(dtype: torch.dtype, num_kv_heads
     # KERNEL
     key_cache, value_cache, gate_cache, block_table, memory, ks = create_state(num_seqs, max_num_blks, chunk_size, num_kv_heads, head_dim, dtype, zero=False, d_tile=d_tile)
     query, key, value, gate = create_input(num_tokens, num_query_heads, num_kv_heads, head_dim, dtype)
-    cu_seqlens_q, cu_seqlens_padded_q, cache_lens, cu_cache_lens, last_memorized_blk_idx = create_metadata(num_seqs, max_num_blks, chunk_size, query_lens, computed_lens)
+    cu_seqlens_q, cu_seqlens_padded_q, cache_lens, cu_cache_lens, last_memorized_blk_idx, seq_lens = create_metadata(num_seqs, max_num_blks, chunk_size, query_lens, computed_lens)
     total_chunks_including_cache = num_tokens // chunk_size + 2 * num_seqs
     BLOCK_S = d_tile ** deg
     num_state_blocks = state_dim // BLOCK_S
@@ -504,7 +505,7 @@ def test_update_intra_chunk_memory_and_cache_3d(dtype: torch.dtype, num_kv_heads
     # Ref
     key_cache_ref, value_cache_ref, gate_cache_ref, block_table_ref, memory_ref, ks_ref = create_state(num_seqs, max_num_blks, chunk_size, num_kv_heads, head_dim, dtype, zero=False, d_tile=d_tile)
     query_ref, key_ref, value_ref, gate_ref = create_input(num_tokens, num_query_heads, num_kv_heads, head_dim, dtype)
-    cu_seqlens_q_ref, cu_seqlens_padded_q_ref, cache_lens_ref, cu_cache_lens_ref, last_memorized_blk_idx_ref = create_metadata(num_seqs, max_num_blks, chunk_size, query_lens, computed_lens)
+    cu_seqlens_q_ref, cu_seqlens_padded_q_ref, cache_lens_ref, cu_cache_lens_ref, last_memorized_blk_idx_ref, seq_lens_ref = create_metadata(num_seqs, max_num_blks, chunk_size, query_lens, computed_lens)
 
     torch.testing.assert_close(memory, memory_ref)
     torch.testing.assert_close(ks, ks_ref)
@@ -597,7 +598,7 @@ def test_unified_query_state(dtype: torch.dtype, num_kv_heads: int, query_per_kv
     key_cache, value_cache, gate_cache, block_table, memory, ks = create_state(num_seqs, max_num_blks, chunk_size, num_kv_heads, head_dim, dtype, zero=False, d_tile=d_tile)
     query, key, value, gate = create_input(num_tokens, num_query_heads, num_kv_heads, head_dim, dtype)
     output = torch.zeros_like(query)
-    cu_seqlens_q, cu_seqlens_padded_q, cache_lens, cu_cache_lens, last_memorized_blk_idx = create_metadata(num_seqs, max_num_blks, chunk_size, query_lens, computed_lens)
+    cu_seqlens_q, cu_seqlens_padded_q, cache_lens, cu_cache_lens, last_memorized_blk_idx, seq_lens = create_metadata(num_seqs, max_num_blks, chunk_size, query_lens, computed_lens)
 
     BLOCK_Q, BLOCK_M = find_block_sizes(chunk_size, query_per_kv_heads)
     total_q_blocks = num_tokens // BLOCK_Q + 2 * num_seqs * (chunk_size // BLOCK_Q)
@@ -653,7 +654,7 @@ def test_unified_query_state(dtype: torch.dtype, num_kv_heads: int, query_per_kv
     # Ref
     key_cache_ref, value_cache_ref, gate_cache_ref, block_table_ref, memory_ref, ks_ref = create_state(num_seqs, max_num_blks, chunk_size, num_kv_heads, head_dim, dtype, zero=False, d_tile=d_tile)
     query_ref, key_ref, value_ref, gate_ref = create_input(num_tokens, num_query_heads, num_kv_heads, head_dim, dtype)
-    cu_seqlens_q_ref, cu_seqlens_padded_q_ref, cache_lens_ref, cu_cache_lens_ref, last_memorized_blk_idx_ref = create_metadata(num_seqs, max_num_blks, chunk_size, query_lens, computed_lens)
+    cu_seqlens_q_ref, cu_seqlens_padded_q_ref, cache_lens_ref, cu_cache_lens_ref, last_memorized_blk_idx_ref, seq_lens_ref = create_metadata(num_seqs, max_num_blks, chunk_size, query_lens, computed_lens)
     output_ref = torch.zeros_like(query_ref)
     unified_query_state_ref(
         output_ref,
