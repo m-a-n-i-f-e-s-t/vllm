@@ -382,6 +382,7 @@ def cumsum_intra_chunk_gate(
     block_table_ptr, # [num_reqs, max_num_blocks_per_req]
     cu_seqlens_q_ptr, # [num_reqs + 1]
     cache_lens_ptr, # [num_reqs]
+    cu_cache_lens_ptr, # [num_reqs + 1]
     last_memorized_blk_idx_ptr, # [num_reqs]
     chunk_size: tl.constexpr, # int
     num_seqs: tl.int32, # int
@@ -401,10 +402,17 @@ def cumsum_intra_chunk_gate(
     #   store the result back to the gate pointer
     block_global_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
-    seq_idx, local_chunk_idx, query_len, query_start_idx = localize_this_pid(cu_seqlens_q_ptr, block_global_idx, num_seqs, chunk_size)
+    seq_idx, local_chunk_idx, query_len, query_start_idx, cache_len = localize_this_pid_with_offset(cu_seqlens_q_ptr, cu_cache_lens_ptr, block_global_idx, num_seqs, chunk_size)
 
-    if local_chunk_idx * chunk_size >= query_len:
+
+    if local_chunk_idx * chunk_size >= query_len + cache_len:
         return
+
+    local_cache_len = tl.minimum(cache_len, tl.maximum(0, chunk_size - local_chunk_idx * chunk_size))
+    local_query_len = tl.maximum(0,
+        tl.minimum(chunk_size, query_len + cache_len - local_chunk_idx * chunk_size) - local_cache_len
+    )
+    local_query_start = tl.maximum(0, local_chunk_idx * chunk_size - cache_len)
 
     # cumsum on top of the last gate entry in the cache, if any
     cache_len = tl.load(cache_lens_ptr + seq_idx)
@@ -421,14 +429,15 @@ def cumsum_intra_chunk_gate(
         tl.store(gate_ptrs, gate + last_cached_gate)
         return
 
-    range_chunk = tl.arange(0, chunk_size) + local_chunk_idx * chunk_size
-    mask_chunk = range_chunk < query_len
+    gate_pos = tl.arange(0, chunk_size)
+    offset_gate = query_start_idx + local_query_start + gate_pos
+    mask_gate = gate_pos < local_query_len
 
-    gate_ptrs = gate_ptr + (query_start_idx + range_chunk) * gate_stride_0 + head_idx * gate_stride_1
-    gates = tl.load(gate_ptrs, mask=mask_chunk, other=0) # [chunk_size]
+    gate_ptrs = gate_ptr + offset_gate * gate_stride_0 + head_idx * gate_stride_1
+    gates = tl.load(gate_ptrs, mask=mask_gate, other=0) # [chunk_size]
     gates = tl.cumsum(gates, axis=0) # [chunk_size]
     gates = gates + last_cached_gate # [chunk_size]
-    tl.store(gate_ptrs, gates, mask=mask_chunk)
+    tl.store(gate_ptrs, gates, mask=mask_gate)
 
 
 @triton.jit
@@ -1352,6 +1361,7 @@ def update_state(
         block_table,
         cu_seqlens_q,
         cache_lens,
+        cu_cache_lens,
         last_memorized_blk_idx,
         chunk_size,
         num_seqs,

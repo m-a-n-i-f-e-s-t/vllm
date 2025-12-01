@@ -21,26 +21,29 @@ def cumsum_intra_chunk_gate_ref(
     block_table: torch.Tensor, # [num_reqs, max_num_blocks_per_req]
     cu_seqlens_q: torch.Tensor, # [num_reqs + 1]
     cache_lens: torch.Tensor, # [num_reqs]
+    cu_cache_lens: torch.Tensor, # [num_reqs + 1]
     last_memorized_blk_idx: torch.Tensor, # [num_reqs]
     chunk_size: int, # int
     num_seqs: int, # int
 ) -> None:
     for seq_idx in range(num_seqs):
-        query_len = cu_seqlens_q[seq_idx + 1] - cu_seqlens_q[seq_idx]
-        cache_len = cache_lens[seq_idx]
+        query_len = (cu_seqlens_q[seq_idx + 1] - cu_seqlens_q[seq_idx]).item()
+        cache_len = cache_lens[seq_idx].item()
         num_chunks = (query_len + cache_len + chunk_size - 1) // chunk_size
+        offset = cu_seqlens_q[seq_idx].item()
         for chunk_idx in range(num_chunks):
             chunk_cache_len = cache_len if chunk_idx == 0 else 0
-            chunk_query_len = max(0, min(chunk_size, query_len + chunk_cache_len - chunk_idx * chunk_size) - chunk_cache_len)
+            chunk_query_len = max(0, min(chunk_size, query_len + cache_len - chunk_idx * chunk_size) - chunk_cache_len)
             if chunk_cache_len > 0:
                 cache_blk = block_table[seq_idx, last_memorized_blk_idx[seq_idx] + 1]
                 last_cached_gate = gate_cache[cache_blk, chunk_cache_len - 1, :]
             else:
                 last_cached_gate = torch.zeros(gate.shape[1], dtype=gate.dtype, device=gate.device)
-            gates = gate[cu_seqlens_q[seq_idx] + chunk_idx * chunk_size:cu_seqlens_q[seq_idx] + chunk_idx * chunk_size + chunk_query_len]
+            gates = gate[offset:offset + chunk_query_len]
             gates = gates.cumsum(dim=0)
             gates = gates + last_cached_gate
-            gate[cu_seqlens_q[seq_idx] + chunk_idx * chunk_size:cu_seqlens_q[seq_idx] + chunk_idx * chunk_size + chunk_query_len] = gates
+            gate[offset:offset + chunk_query_len] = gates
+            offset += chunk_query_len
 
 def sympow_dim(d, power, d_tile=1):
     if d_tile == 1:
@@ -213,6 +216,7 @@ def update_state_ref(
         block_table,
         cu_seqlens_q,
         cache_lens,
+        cu_cache_lens,
         last_memorized_blk_idx,
         chunk_size,
         num_seqs,
@@ -474,7 +478,8 @@ def create_state(num_seqs: int, max_num_blks: int, chunk_size: int, num_kv_heads
     total_num_blks = num_seqs * max_num_blks
     key_cache = fn(total_num_blks, chunk_size, num_kv_heads, head_dim, dtype=dtype, device="cuda")
     value_cache = fn(total_num_blks, chunk_size, num_kv_heads, head_dim, dtype=dtype, device="cuda")
-    gate_cache = F.logsigmoid(fn(total_num_blks, chunk_size, num_kv_heads, dtype=torch.float32, device="cuda")).cumsum(dim=1)
+    # gate_cache = F.logsigmoid(fn(total_num_blks, chunk_size, num_kv_heads, dtype=torch.float32, device="cuda")).cumsum(dim=1)
+    gate_cache = torch.ones(total_num_blks, chunk_size, num_kv_heads, dtype=torch.float32, device="cuda") * 0.1
     all_blocks = torch.randperm(total_num_blks, device="cuda", dtype=torch.int32)
     block_table = all_blocks.reshape(num_seqs, max_num_blks)
     memory = fn(total_num_blks, num_kv_heads, state_dim, head_dim, dtype=dtype, device="cuda")
@@ -486,7 +491,8 @@ def create_input(num_tokens: int, num_query_heads: int, num_kv_heads: int, head_
     query = torch.randn(num_tokens, num_query_heads, head_dim, dtype=dtype, device="cuda")
     key = torch.randn(num_tokens, num_kv_heads, head_dim, dtype=dtype, device="cuda")
     value = torch.randn(num_tokens, num_kv_heads, head_dim, dtype=dtype, device="cuda")
-    gate = F.logsigmoid(torch.randn(num_tokens, num_kv_heads, dtype=torch.float32, device="cuda"))
+    # gate = F.logsigmoid(torch.randn(num_tokens, num_kv_heads, dtype=torch.float32, device="cuda"))
+    gate = torch.ones(num_tokens, num_kv_heads, dtype=torch.float32, device="cuda")
     return query, key, value, gate
 
 def create_metadata(num_seqs: int, max_num_blks: int, block_size: int, query_lens: tuple[int,...], computed_lens: tuple[int,...]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -526,11 +532,10 @@ def test_cumsum_intra_chunk_gate(dtype: torch.dtype, num_kv_heads: int, query_pe
 
     torch.testing.assert_close(gate, gate_ref)
     torch.testing.assert_close(gate_cache, gate_cache_ref)
-    original_gate = gate.clone()
-    original_gate_cache = gate_cache.clone()
 
-    cumsum_intra_chunk_gate[(total_chunks, num_kv_heads)](gate, gate_cache, block_table, cu_seqlens_q, cache_lens, last_memorized_blk_idx, chunk_size, num_seqs, *gate.stride(), *gate_cache.stride(), *block_table.stride())
-    cumsum_intra_chunk_gate_ref(gate_ref, gate_cache_ref, block_table_ref, cu_seqlens_q_ref, cache_lens_ref, last_memorized_blk_idx_ref, chunk_size, num_seqs)
+    cumsum_intra_chunk_gate[(total_chunks, num_kv_heads)](gate, gate_cache, block_table, cu_seqlens_q, cache_lens, cu_cache_lens, last_memorized_blk_idx, chunk_size, num_seqs, *gate.stride(), *gate_cache.stride(), *block_table.stride())
+    cumsum_intra_chunk_gate_ref(gate_ref, gate_cache_ref, block_table_ref, cu_seqlens_q_ref, cache_lens_ref, cu_cache_lens_ref, last_memorized_blk_idx_ref, chunk_size, num_seqs)
+
     torch.testing.assert_close(gate, gate_ref)
 
 
