@@ -581,7 +581,7 @@ def test_update_intra_chunk_memory_and_cache_3d(dtype: torch.dtype, num_kv_heads
 @pytest.mark.parametrize("query_per_kv_heads", [1, 2, 5])
 @pytest.mark.parametrize("head_dim", [32, 128])
 @pytest.mark.parametrize("chunk_size", [32])
-@pytest.mark.parametrize("query_lens", [(1, 23,), (1, 41), (1, 1)])
+@pytest.mark.parametrize("query_lens", [(1, 23,), (1, 41), (64, 127)])
 @pytest.mark.parametrize("computed_lens", [(16, 0), (1, 64), (0, 0), (33, 129)])
 @pytest.mark.parametrize("d_tile", [8])
 def test_unified_query_state(dtype: torch.dtype, num_kv_heads: int, query_per_kv_heads: int, head_dim: int, chunk_size: int, query_lens: tuple[int, int], computed_lens: tuple[int, int], d_tile: int) -> None:
