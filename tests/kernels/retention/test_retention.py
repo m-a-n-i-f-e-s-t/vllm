@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from torch._dynamo import cache_size
 import pytest
 import torch
 import math
@@ -163,23 +164,26 @@ def cumsum_inter_chunk_memory_ref(
         cache_len = cache_lens[seq_idx]
         last_memorized_blk = last_memorized_blk_idx[seq_idx]
         if last_memorized_blk >= 0:
-            prev_mem = memory[last_memorized_blk, :, :, :]
-            prev_ks = ks[last_memorized_blk, :, :]
+            blk_id = block_table[seq_idx, last_memorized_blk]
+            prev_mem = memory[blk_id]
+            prev_ks = ks[blk_id]
         else:
-            prev_mem = torch.zeros(*memory.shape[1:], dtype=memory.dtype)
-            prev_ks = torch.zeros(*ks.shape[1:], dtype=ks.dtype)
+            prev_mem = torch.zeros(*memory.shape[1:], dtype=memory.dtype, device=memory.device)
+            prev_ks = torch.zeros(*ks.shape[1:], dtype=ks.dtype, device=ks.device)
         num_full_chunks = (cache_len + query_len) // chunk_size
-        cur_query_len = chunk_size - cache_len
+        gate_offset = query_start + chunk_size - cache_len - 1
         for chunk_idx in range(num_full_chunks):
             blk_idx = block_table[seq_idx, last_memorized_blk + chunk_idx + 1]
-            mem = memory[blk_idx] #[num_kv_heads, state_dim, head_dim]
-            ks = ks[blk_idx]
-            gate = gate[query_start + chunk_idx * chunk_size + cur_query_len - 1, :]
-            mem = prev_mem * gate[:, None, None] + mem
-            ks = prev_ks * gate[:, None] + ks
-            memory[blk_idx] = mem
-            ks[blk_idx] = ks
-            cur_query_len = chunk_size
+            mem_block = memory[blk_idx] # [num_kv_heads, state_dim, head_dim]
+            ks_block = ks[blk_idx]
+            gate_value = gate[gate_offset]
+            mem_block = prev_mem * gate_value[:, None, None] + mem_block
+            ks_block = prev_ks * gate_value[:, None] + ks_block
+            memory[blk_idx] = mem_block
+            ks[blk_idx] = ks_block
+            prev_mem = mem_block
+            prev_ks = ks_block
+            gate_offset += chunk_size
 
 
 def update_state_ref(
@@ -535,9 +539,11 @@ def test_cumsum_intra_chunk_gate(dtype: torch.dtype, num_kv_heads: int, query_pe
 @pytest.mark.parametrize("query_per_kv_heads", [1])
 @pytest.mark.parametrize("head_dim", [32, 128])
 @pytest.mark.parametrize("chunk_size", [32])
-@pytest.mark.parametrize("query_lens", [(23,), (1, 41), (1, 1)])
+@pytest.mark.parametrize("query_lens", [(23, 1), (1, 41), (1, 1)])
 @pytest.mark.parametrize("computed_lens", [(16, 0), (1, 64), (0, 0), (33, 129)])
 def test_update_intra_chunk_memory_and_cache_3d(dtype: torch.dtype, num_kv_heads: int, query_per_kv_heads: int, head_dim: int, chunk_size: int, query_lens: tuple[int, int], computed_lens: tuple[int, int]) -> None:
+    if len(query_lens) != len(computed_lens):
+        pytest.mark.skip("query_lens and computed_lens must have the same length")
     num_tokens = sum(query_lens)
     max_num_blks = (max([q + c for q, c in zip(query_lens, computed_lens)]) + chunk_size - 1) // chunk_size
     num_query_heads = num_kv_heads * query_per_kv_heads
@@ -627,6 +633,74 @@ def test_update_intra_chunk_memory_and_cache_3d(dtype: torch.dtype, num_kv_heads
     torch.testing.assert_close(value, value_ref)
     torch.testing.assert_close(gate, gate_ref)
 
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("num_kv_heads", [4, 16])
+@pytest.mark.parametrize("query_per_kv_heads", [1])
+@pytest.mark.parametrize("head_dim", [32, 128])
+@pytest.mark.parametrize("chunk_size", [32])
+@pytest.mark.parametrize("query_lens", [(23, 1), (1, 41), (64, 127)])
+@pytest.mark.parametrize("computed_lens", [(16, 0), (1, 64), (0, 0), (33, 129)])
+def test_cumsum_inter_chunk_memory(dtype: torch.dtype, num_kv_heads: int, query_per_kv_heads: int, head_dim: int, chunk_size: int, query_lens: tuple[int, int], computed_lens: tuple[int, int]) -> None:
+    if len(query_lens) != len(computed_lens):
+        pytest.mark.skip("query_lens and computed_lens must have the same length")
+    num_tokens = sum(query_lens)
+    max_num_blks = (max([q + c for q, c in zip(query_lens, computed_lens)]) + chunk_size - 1) // chunk_size
+    num_query_heads = num_kv_heads * query_per_kv_heads
+    num_seqs = len(query_lens)
+    d_tile = 16
+    deg = 2
+    state_dim = sympow_dim(head_dim, deg, d_tile)
+    BLOCK_S = d_tile ** deg
+    num_state_blocks = state_dim // BLOCK_S
+    # kernel inputs
+    key_cache, value_cache, gate_cache, block_table, memory, ks = create_state(num_seqs, max_num_blks, chunk_size, num_kv_heads, head_dim, dtype, zero=False, d_tile=d_tile)
+    query, key, value, gate = create_input(num_tokens, num_query_heads, num_kv_heads, head_dim, dtype)
+    cu_seqlens_q, cu_seqlens_padded_q, cache_lens, cu_cache_lens, last_memorized_blk_idx, seq_lens = create_metadata(num_seqs, max_num_blks, chunk_size, query_lens, computed_lens) 
+    # ref inputs
+    key_cache_ref, value_cache_ref, gate_cache_ref, block_table_ref, memory_ref, ks_ref = create_state(num_seqs, max_num_blks, chunk_size, num_kv_heads, head_dim, dtype, zero=False, d_tile=d_tile)
+    query_ref, key_ref, value_ref, gate_ref = create_input(num_tokens, num_query_heads, num_kv_heads, head_dim, dtype)
+    cu_seqlens_q_ref, cu_seqlens_padded_q_ref, cache_lens_ref, cu_cache_lens_ref, last_memorized_blk_idx_ref, seq_lens_ref = create_metadata(num_seqs, max_num_blks, chunk_size, query_lens, computed_lens)
+
+    # check inputs are created correctly
+    torch.testing.assert_close(memory, memory_ref)
+    torch.testing.assert_close(ks, ks_ref)
+    torch.testing.assert_close(gate_cache, gate_cache_ref)
+    torch.testing.assert_close(gate, gate_ref)
+
+    # kernel call
+    cumsum_inter_chunk_memory[(num_seqs, num_kv_heads, num_state_blocks)](
+        memory,
+        ks,
+        gate,
+        block_table,
+        last_memorized_blk_idx,
+        cu_seqlens_q,
+        cache_lens,
+        head_dim,
+        BLOCK_S,
+        chunk_size,
+        *memory.stride(),
+        *ks.stride(),
+        *gate.stride(),
+        *block_table.stride(),
+    )
+
+    # ref call
+    cumsum_inter_chunk_memory_ref(
+        memory_ref,
+        ks_ref,
+        gate_ref,
+        block_table_ref,
+        last_memorized_blk_idx_ref,
+        cu_seqlens_q_ref,
+        cache_lens_ref,
+        chunk_size,
+    )
+
+    # Check
+    torch.testing.assert_close(memory, memory_ref, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(ks, ks_ref, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32])
