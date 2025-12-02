@@ -1113,7 +1113,7 @@ def unified_query_state_2d(
     # 1. This is a padded sequence by vllm
     # 2. This block is at the start of the first chunk where it's all cached tokens
     # 3. This block is at the end of the last chunk where there's no scheduled tokens
-    if block_scheduled_len <= 0:
+    if block_scheduled_len <= 0 or seq_idx >= num_seqs:
         return
 
     offs_m = tl.arange(0, BLOCK_M)
