@@ -445,9 +445,10 @@ def discount_keys(
     x, # [D, N]
     cum_log_gates, # [N]
     last_gate, # [1]
+    deg: tl.constexpr, # int
 ):
     reversed_cum_log_gates = last_gate - cum_log_gates
-    discounted_x = x * reversed_cum_log_gates.exp()[None, :]
+    discounted_x = x * (reversed_cum_log_gates / deg).exp()[None, :]
     return discounted_x.to(x.dtype)
 
 
@@ -469,6 +470,7 @@ def update_intra_chunk_memory_and_cache_3d(
     num_seqs: tl.int32, # int
     head_dim: tl.constexpr, # int
     d_tile: tl.constexpr, # int
+    deg: tl.constexpr, # int
     BLOCK_T: tl.constexpr, # int
     key_stride_0: tl.int64, # int
     key_stride_1: tl.int64, # int
@@ -551,7 +553,7 @@ def update_intra_chunk_memory_and_cache_3d(
             cached_gates = tl.load(gate_cache_ptr + range_t * gate_cache_stride_1, mask=mask_t, other=0)
             # discount keys, note that the last gate is actully in the scheduled tokens
             last_gate = tl.load(gate_ptr + (local_schedule_len - 1) * gate_stride_0).to(tl.float32)
-            discounted_keys = discount_keys(cached_keys, cached_gates, last_gate)
+            discounted_keys = discount_keys(cached_keys, cached_gates, last_gate, deg)
             acc, l = block_sympow_m_mma(discounted_keys, cached_values, acc, l, BLOCK_T, head_dim, power, d_tile, tile_idx_0, tile_idx_1)
         
     # handle scheduled tokens, update_state if enough tokens to fill a chunk
@@ -564,7 +566,7 @@ def update_intra_chunk_memory_and_cache_3d(
             gates = tl.load(gate_ptr + range_t * gate_stride_0, mask=mask_t, other=0)
             # discount keys
             last_gate = tl.load(gate_ptr + (local_schedule_len - 1) * gate_stride_0).to(tl.float32)
-            discounted_keys = discount_keys(keys, gates, last_gate)
+            discounted_keys = discount_keys(keys, gates, last_gate, deg)
             acc, l = block_sympow_m_mma(discounted_keys, values, acc, l, BLOCK_T, head_dim, power, d_tile, tile_idx_0, tile_idx_1)
 
         memory_ptr, ks_ptr = localize_memory_and_ks_ptrs(memory_ptr, ks_ptr, block_table_ptr, last_memorized_blk_idx_ptr, seq_idx, head_idx, cache_len, local_chunk_idx, block_table_stride_0, block_table_stride_1, memory_stride_0, memory_stride_1, ks_stride_0, ks_stride_1)
@@ -711,7 +713,7 @@ def cumsum_inter_chunk_memory(
         blk_seq_idx = initial_memory_blk_seq_idx + chunk_idx + 1
         blk_idx = tl.load(blk_table_ptr + blk_seq_idx * block_table_stride_1).to(tl.int64)
         memory, ks = read_memory_and_ks(memory_ptr, ks_ptr, blk_idx, BLOCK_S, head_dim, memory_stride_0, memory_stride_2, memory_stride_3, ks_stride_0, ks_stride_2)
-        gate = tl.load(gate_ptr + (this_schedule_len - 1) * gate_stride_0).to(tl.float32) # [1]
+        gate = tl.load(gate_ptr + (this_schedule_len - 1) * gate_stride_0).to(tl.float32).exp() # [1]
         memory = prev_memory * gate + memory
         ks = prev_ks * gate + ks
         write_memory_and_ks(memory_ptr, ks_ptr, memory, ks, blk_idx, BLOCK_S, head_dim, memory_stride_0, memory_stride_2, memory_stride_3, ks_stride_0, ks_stride_2)
@@ -1166,9 +1168,9 @@ def unified_query_state_2d(
     acc, L, M = query_cache(Q, GQ, query_pos, acc, L, M, key_ptr, value_ptr, gate_ptr, key_cache_ptr, value_cache_ptr, gate_cache_ptr, offs_t, offs_d, query_mask, dim_mask, first_cached_block_idx, query_token_offset, kv_head_idx, chunk_idx, cache_len, query_len, chunk_cache_len, cached_tile_end, scheduled_tile_start, scheduled_tile_end, scale, deg, chunk_size, BLOCK_M, TILE_SIZE, BLOCK_SIZE, key_cache_stride_0, key_cache_stride_1, key_cache_stride_2, key_cache_stride_3, value_cache_stride_0, value_cache_stride_1, value_cache_stride_2, value_cache_stride_3, gate_cache_stride_0, gate_cache_stride_1, gate_cache_stride_2, key_stride_0, key_stride_1, key_stride_2, value_stride_0, value_stride_1, value_stride_2, gate_stride_0, gate_stride_1)
 
     # Query against memory
-    if last_memorized_blk_idx >= 0: # skip if no memory yet
+    if last_memorized_blk_idx + chunk_idx >= 0: # skip if no memory yet
         acc, L = query_memory(Q, GQ, acc, L, M, memory_ptr, ks_ptr, block_table_ptr, offs_d, scale, last_memorized_blk_idx, seq_idx, chunk_idx, kv_head_idx, d_tile, deg, state_dim, HEAD_SIZE, BLOCK_M, block_table_stride_0, memory_stride_0, memory_stride_1, memory_stride_2, memory_stride_3, ks_stride_0, ks_stride_1, ks_stride_2)
-           
+
     # epilogue
     acc = acc / L[:, None]
 
@@ -1393,6 +1395,7 @@ def update_state(
         num_seqs,
         head_dim,
         d_tile,
+        deg,
         BLOCK_T,
         *key.stride(),
         *value.stride(),

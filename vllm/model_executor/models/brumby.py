@@ -157,12 +157,7 @@ class BrumbyRetention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         g, _ = self.g_proj(hidden_states)
         log_g = F.logsigmoid(g)
-        # torch.save(q, f"vllm_q_{self.layer_idx}.pt")
-        # torch.save(k, f"vllm_k_{self.layer_idx}.pt")
-        # torch.save(v, f"vllm_v_{self.layer_idx}.pt")
-        # torch.save(log_g, f"vllm_log_g_{self.layer_idx}.pt")
         attn_output = self.attn(q, k, v, log_g)
-        # torch.save(attn_output, f"vllm_attn_output_{self.layer_idx}.pt")
         output, _ = self.o_proj(attn_output)
         return output
 
