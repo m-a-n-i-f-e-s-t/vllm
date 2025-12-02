@@ -37,7 +37,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.mamba.ops.retention import power_retention_varlen
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.retention import RetentionMetadata
-from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
+from vllm.v1.kv_cache_interface import KVCacheSpec, RetentionSpec
 from vllm.config import VllmConfig
 
 if TYPE_CHECKING:
@@ -110,6 +110,29 @@ class Retention(MambaBase, CustomOp):
             head_dim=self.head_dim,
             state_dim=self.state_dim,
             chunk_size=self.chunk_size,
+        )
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        if (
+            vllm_config.speculative_config is not None
+            and vllm_config.model_config.hf_config.model_type not in ["qwen3_next"]
+        ):
+            raise NotImplementedError(
+                "Mamba with speculative decoding is not supported yet."
+            )
+        mamba_block_size = vllm_config.cache_config.mamba_block_size
+        page_size_padded = vllm_config.cache_config.mamba_page_size_padded
+        return RetentionSpec(
+            shapes=self.get_state_shape(),
+            dtypes=self.get_state_dtype(),
+            block_size=mamba_block_size,
+            page_size_padded=page_size_padded,
+            mamba_type=self.mamba_type,
+            num_speculative_blocks=(
+                vllm_config.speculative_config.num_speculative_tokens
+                if vllm_config.speculative_config
+                else 0
+            ),
         )
 
     def forward(

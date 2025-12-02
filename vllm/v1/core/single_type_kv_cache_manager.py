@@ -14,6 +14,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
     MambaSpec,
+    RetentionSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
 )
@@ -724,6 +725,7 @@ spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
     SlidingWindowSpec: SlidingWindowManager,
     ChunkedLocalAttentionSpec: ChunkedLocalAttentionManager,
     MambaSpec: MambaManager,
+    RetentionSpec: MambaManager,
     CrossAttentionSpec: CrossAttentionManager,
 }
 

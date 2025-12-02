@@ -264,6 +264,22 @@ class MambaSpec(KVCacheSpec):
 
 
 @dataclass(frozen=True)
+class RetentionSpec(MambaSpec):
+    shapes: tuple[tuple[int, ...], ...]
+    dtypes: tuple[torch.dtype]
+    page_size_padded: int | None = None
+    mamba_type: str = "retention"
+    num_speculative_blocks: int = 0
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        # Use max_num_batched_tokens since retention state is bounded by batch
+        # size, not context length. Fall back to max_model_len if not set.
+        max_tokens = (vllm_config.scheduler_config.max_num_batched_tokens
+                      or vllm_config.model_config.max_model_len)
+        return cdiv(max_tokens, self.block_size) * self.page_size_bytes
+
+
+@dataclass(frozen=True)
 class EncoderOnlyAttentionSpec(AttentionSpec):
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         # Encoder-only layers do not need KV cache

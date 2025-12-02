@@ -1,9 +1,9 @@
 import torch
 import triton
 import triton.language as tl
-import itertools
 import math
 from functools import lru_cache
+from vllm.utils.platform_utils import get_cu_count
 
 @triton.jit
 def binom(n: tl.constexpr, k: tl.constexpr):
@@ -695,6 +695,13 @@ def cumsum_inter_chunk_memory(
     gate_ptr = gate_ptr + cu_seqlens * gate_stride_0 + head_idx * gate_stride_1
     blk_table_ptr = block_table_ptr + seq_idx * block_table_stride_0
 
+    # only perform memory cumsum for full chunks
+    cache_len = tl.load(cache_lens_ptr + seq_idx)
+    num_full_chunks = (cache_len + cur_query_len) // chunk_size
+    this_schedule_len = chunk_size - cache_len
+    if num_full_chunks == 0: # no need to perform memory cumsum if there's no full chunks
+        return
+
     # read initial memory and ks
     if initial_memory_blk_seq_idx >= 0:
         initial_memory_blk_idx = tl.load(blk_table_ptr + initial_memory_blk_seq_idx * block_table_stride_1).to(tl.int64)
@@ -702,11 +709,6 @@ def cumsum_inter_chunk_memory(
     else:
         prev_memory = tl.zeros((BLOCK_S, head_dim), dtype=tl.float32)
         prev_ks = tl.zeros((BLOCK_S,), dtype=tl.float32)
-
-    # only perform memory cumsum for full chunks
-    cache_len = tl.load(cache_lens_ptr + seq_idx)
-    num_full_chunks = (cache_len + cur_query_len) // chunk_size
-    this_schedule_len = chunk_size - cache_len
 
     # cumsum through all full blocks for the request
     for chunk_idx in tl.range(num_full_chunks):
@@ -1194,33 +1196,27 @@ def find_block_sizes(chunk_size: int, num_queries_per_kv: int) -> tuple[int, int
     """ Find BLOCK_Q and BLOCK_M such that
     1. chunk_size is divisible by BLOCK_Q
     2. BLOCK_M >= BLOCK_Q * num_queries_per_kv
-    3. BLOCK_M is a power of 2 and >= 16
-    4. BLOCK_M is as small as possible
+    3. BLOCK_M is a power of 2 and >= 16 and <= 256
+    4. BLOCK_Q is as small as possible to maximize parallelism
+    
+    Note: We use fixed block sizes independent of num_seqs to ensure
+    consistent Triton kernel compilation between CUDA graph capture
+    and eager execution. 
     """
-    # Find all divisors of chunk_size
-    divisors = []
-    for i in range(1, int(math.sqrt(chunk_size)) + 1):
-        if chunk_size % i == 0:
-            divisors.append(i)
-            if i != chunk_size // i:
-                divisors.append(chunk_size // i)
-    divisors.sort(reverse=True)
+    divisors = sorted({d for i in range(1, int(math.sqrt(chunk_size)) + 1) 
+                       if chunk_size % i == 0 for d in (i, chunk_size // i)})
     
-    # Start with the smallest power of 2 that is >= 16
-    block_m = 16
+    # Find smallest valid BLOCK_Q that divides chunk_size
+    for block_q in divisors:
+        # Find smallest BLOCK_M that is a power of 2 and >= BLOCK_Q * num_queries_per_kv
+        block_m = 16
+        while block_m < block_q * num_queries_per_kv:
+            block_m *= 2
+        if block_m <= 256:
+            return block_q, block_m
     
-    # Try increasing powers of 2 for BLOCK_M
-    while block_m <= chunk_size * num_queries_per_kv:
-        # Find the largest divisor (BLOCK_Q) that satisfies BLOCK_Q * num_queries_per_kv <= BLOCK_M
-        for block_q in divisors:
-            if block_q * num_queries_per_kv <= block_m:
-                return block_q, block_m
-        
-        # Try next power of 2
-        block_m *= 2
-    
-    # Fallback: shouldn't reach here if inputs are reasonable
-    return chunk_size, block_m
+    # Fallback
+    return chunk_size, max(16, chunk_size * num_queries_per_kv)
 
 def query_state(
     output: torch.Tensor, # [num_tokens, num_query_heads, head_dim]
