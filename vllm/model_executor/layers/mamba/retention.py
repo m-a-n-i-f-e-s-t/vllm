@@ -195,6 +195,7 @@ class Retention(MambaBase, CustomOp):
         value = value.view(-1, self.num_kv_heads, self.head_dim)
         gate = gate.view(-1, self.num_kv_heads)
         output = output.view(-1, self.num_heads, self.head_dim)
+        has_prefill = attn_metadata.num_prefills > 0
         
         # Call kernel
         power_retention_varlen(
@@ -219,8 +220,8 @@ class Retention(MambaBase, CustomOp):
             self.chunk_size,
             self.d_tile,
             self.power,
+            has_prefill,
         )
-        
 
 
 def retention(

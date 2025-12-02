@@ -3,7 +3,6 @@ import triton
 import triton.language as tl
 import math
 from functools import lru_cache
-from vllm.utils.platform_utils import get_cu_count
 
 @triton.jit
 def binom(n: tl.constexpr, k: tl.constexpr):
@@ -181,12 +180,6 @@ def localize_this_pid_in_chunk(
     # get scheduled length
     query_token_offset = tl.load(cu_seqlens_q_ptr + seq_idx)
     query_len = (tl.load(cu_seqlens_q_ptr + seq_idx + 1) - query_token_offset).to(tl.int32)
-    # padded_query_len = (tl.load(cu_seqlens_padded_q_ptr + seq_idx + 1) - tl.load(cu_seqlens_padded_q_ptr + seq_idx)).to(tl.int32)
-    # num_chunks = (padded_query_len // chunk_size).to(tl.int32)
-    # if chunk_idx == 0:
-    #     chunk_scheduled_len = tl.minimum(chunk_size, cache_len + query_len) - cache_len
-    # else:
-    #     chunk_scheduled_len = tl.minimum(chunk_size, cache_len + query_len - chunk_idx * chunk_size)
 
     block_scheduled_len = tl.maximum(0, tl.minimum(
         BLOCK_SIZE,
@@ -1048,6 +1041,7 @@ def unified_query_state_2d(
     BLOCK_M: tl.constexpr,  # int
     deg: tl.constexpr, # int
     chunk_size: tl.constexpr, # int
+    has_prefill: tl.constexpr, # bool
     state_dim: tl.float32, # float (for stablization)
     output_stride_0: tl.int64,  # int
     output_stride_1: tl.int64,  # int, should be equal to head_size
@@ -1101,7 +1095,18 @@ def unified_query_state_2d(
     # cache_len: the number of cached tokens in this sequence
     # chunk_cache_len: the number of cached tokens in this chunk
     # block_scheduled_len: the number of scheduled tokens in this block
-    seq_idx, chunk_idx, local_block_idx, query_block_idx, query_len, query_token_offset, cache_len, chunk_cache_len, block_scheduled_len = localize_this_pid_in_chunk(cu_seqlens_q_ptr, cu_seqlens_padded_q_ptr, cache_lens_ptr, q_block_global_idx, num_seqs, BLOCK_Q, chunk_size)
+    if has_prefill:
+        seq_idx, chunk_idx, local_block_idx, query_block_idx, query_len, query_token_offset, cache_len, chunk_cache_len, block_scheduled_len = localize_this_pid_in_chunk(cu_seqlens_q_ptr, cu_seqlens_padded_q_ptr, cache_lens_ptr, q_block_global_idx, num_seqs, BLOCK_Q, chunk_size)
+    else:
+        seq_idx = q_block_global_idx
+        chunk_idx = 0
+        local_block_idx = 0
+        query_block_idx = 0
+        query_len = 1
+        query_token_offset = tl.load(cu_seqlens_q_ptr + seq_idx)
+        cache_len = tl.load(cache_lens_ptr + seq_idx)
+        chunk_cache_len = cache_len
+        block_scheduled_len = 1
 
 
     # skip if there's no scheduled tokens in this block, could be due to:
@@ -1114,7 +1119,11 @@ def unified_query_state_2d(
     offs_m = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_SIZE)
     offs_t = tl.arange(0, TILE_SIZE)
-    query_pos = query_block_idx * BLOCK_Q + offs_m // num_queries_per_kv
+    # Account for the different grid semantics for mixed-prefill and pure-decode
+    if has_prefill:
+        query_pos = query_block_idx * BLOCK_Q + offs_m // num_queries_per_kv
+    else:
+        query_pos = query_block_idx * BLOCK_Q + offs_m // num_queries_per_kv + cache_len
 
     query_offset_0 = query_token_offset + query_pos - cache_len
     query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
@@ -1157,7 +1166,10 @@ def unified_query_state_2d(
 
     # scheduled tiles
     scheduled_tile_start = chunk_cache_len // TILE_SIZE
-    scheduled_tile_end = tl.cdiv((local_block_idx + 1) * BLOCK_Q, TILE_SIZE)
+    if has_prefill:
+        scheduled_tile_end = tl.cdiv((local_block_idx + 1) * BLOCK_Q, TILE_SIZE)
+    else:
+        scheduled_tile_end = tl.cdiv((local_block_idx + 1) * BLOCK_Q + cache_len, TILE_SIZE)
 
     # find cache block index
     last_memorized_blk_idx = tl.load(last_memorized_blk_idx_ptr + seq_idx).to(tl.int64)
@@ -1238,6 +1250,7 @@ def query_state(
     scale: float, # float
     d_tile: int, # int
     deg: int, # int
+    has_prefill: bool, # bool
 ):
     # query_state kernel queries both cache and memory. 
     # The first is a chunked attention, the second is a symmetric-power-matmul with memory.
@@ -1262,13 +1275,20 @@ def query_state(
     # \sum_i(\sum_j(cdiv(chunk_query_len[i][j], BLOCK_Q)) kernels along sequence dimension
     # where chunk_query_len[i][j] is the number of tokens in the j-th chunk of the i-th sequence.
     # but materializing chunk_query_len on cpu is slow, so we take its upper bound
-    # \sum_i(\sum_j(cdiv(chunk_query_len[i][j], BLOCK_Q))
-    #  <= \sum_i(\sum_j(cdiv(chunk_size, BLOCK_Q))
-    #  <= \sum_i((chunk_size // BLOCK_Q) * (cdiv(query_len[i], chunk_size) + 1))
-    #  = \sum_i(cdiv(query_len[i], chunk_size) * (chunk_size // BLOCK_Q) + num_seqs * (chunk_size // BLOCK_Q))
-    #  <= (num_tokens // chunk_size + num_seqs) * (chunk_size // BLOCK_Q) + num_seqs * (chunk_size // BLOCK_Q)
-    #  = num_tokens // BLOCK_Q + 2 * num_seqs * (chunk_size // BLOCK_Q)
-    total_q_blocks = num_tokens // BLOCK_Q + 2 * num_seqs * (chunk_size // BLOCK_Q)
+    if has_prefill:
+        # For mixed prefill and decode, we can't make assumptions about the number of tokens in the cache, so the
+        # upper bound is loose:
+        # \sum_i(\sum_j(cdiv(chunk_query_len[i][j], BLOCK_Q))
+        #  <= \sum_i(\sum_j(cdiv(chunk_size, BLOCK_Q))
+        #  <= \sum_i((chunk_size // BLOCK_Q) * (cdiv(query_len[i], chunk_size) + 1))
+        #  = \sum_i(cdiv(query_len[i], chunk_size) * (chunk_size // BLOCK_Q) + num_seqs * (chunk_size // BLOCK_Q))
+        #  <= (num_tokens // chunk_size + num_seqs) * (chunk_size // BLOCK_Q) + num_seqs * (chunk_size // BLOCK_Q)
+        #  = num_tokens // BLOCK_Q + 2 * num_seqs * (chunk_size // BLOCK_Q)
+        total_q_blocks = num_tokens // BLOCK_Q + 2 * num_seqs * (chunk_size // BLOCK_Q)
+    else:
+        # For decode, we only need to launch as many CTAs as there are queries, this reduces overhead massively
+        total_q_blocks = num_seqs
+
     TILE_SIZE = 16
     BLOCK_SIZE = chunk_size
 
@@ -1300,6 +1320,7 @@ def query_state(
         BLOCK_M,
         deg,
         chunk_size,
+        has_prefill,
         float(state_dim),
         output.stride(0),
         output.stride(1),
@@ -1447,6 +1468,7 @@ def power_retention_varlen(
     chunk_size : int, # int
     d_tile: int, # int
     deg: int, # int
+    has_prefill: bool, # bool
 ):
     """
     last_hashed_memory_blk_idx[i] the last block index in request i's block table that has memory computed, which is also the last block hashed by vllm. If there is no memory computed, last_hashed_memory_blk_idx[i] = -1.
@@ -1491,4 +1513,5 @@ def power_retention_varlen(
         scale,
         d_tile,
         deg,
+        has_prefill,
     )

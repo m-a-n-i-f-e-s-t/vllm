@@ -436,6 +436,7 @@ def query_state_ref(
     scale: float, # float
     d_tile: int, # int
     deg: int, # int
+    has_prefill: bool, # bool
 ):
     num_query_heads = query.shape[1]
     num_kv_heads = key.shape[1]
@@ -489,6 +490,7 @@ def power_retention_varlen_ref(
     chunk_size : int, # int
     d_tile: int, # int
     deg: int, # int
+    has_prefill: bool, # bool
 ):
     update_state_ref(
         key,
@@ -530,6 +532,7 @@ def power_retention_varlen_ref(
         scale,
         d_tile,
         deg,
+        has_prefill,
     )
 
 
@@ -852,7 +855,7 @@ def test_cumsum_inter_chunk_memory(dtype: torch.dtype, num_kv_heads: int, query_
 @pytest.mark.parametrize("query_per_kv_heads", [1, 2, 5])
 @pytest.mark.parametrize("head_dim", [32, 128])
 @pytest.mark.parametrize("chunk_size", [32])
-@pytest.mark.parametrize("query_lens", [(1, 23,), (1, 41), (64, 127)])
+@pytest.mark.parametrize("query_lens", [(1, 23,), (1, 41), (64, 127), (1, 1)])
 @pytest.mark.parametrize("computed_lens", [(16, 0), (1, 64), (0, 0), (33, 129)])
 @pytest.mark.parametrize("d_tile", [8])
 def test_query_state(dtype: torch.dtype, num_kv_heads: int, query_per_kv_heads: int, head_dim: int, chunk_size: int, query_lens: tuple[int, int], computed_lens: tuple[int, int], d_tile: int) -> None:
@@ -863,7 +866,8 @@ def test_query_state(dtype: torch.dtype, num_kv_heads: int, query_per_kv_heads: 
     num_query_heads = num_kv_heads * query_per_kv_heads
     num_seqs = len(query_lens)
     deg = 2
-    state_dim = sympow_dim(head_dim, deg, d_tile)
+    has_prefill = any(q > 1 for q in query_lens)
+
     # KERNEL
     key_cache, value_cache, gate_cache, block_table, memory, ks = create_state(num_seqs, max_num_blks, chunk_size, num_kv_heads, head_dim, dtype, zero=False, d_tile=d_tile)
     query, key, value, gate = create_input(num_tokens, num_query_heads, num_kv_heads, head_dim, dtype)
@@ -889,6 +893,7 @@ def test_query_state(dtype: torch.dtype, num_kv_heads: int, query_per_kv_heads: 
         float(head_dim)**-0.5,
         d_tile,
         deg,
+        has_prefill
     )
 
 
@@ -917,6 +922,7 @@ def test_query_state(dtype: torch.dtype, num_kv_heads: int, query_per_kv_heads: 
         float(head_dim)**-0.5,
         d_tile,
         deg,
+        has_prefill,
     )
 
     # Check
@@ -942,7 +948,7 @@ def test_varlen_sementics(dtype: torch.dtype, num_kv_heads: int, query_per_kv_he
     num_seqs = len(query_lens)
     d_tile = 16
     deg = 2
-    state_dim = sympow_dim(head_dim, deg, d_tile)
+    has_prefill = any(q > 1 for q in query_lens)
 
     # Ref inputs
     key_cache, value_cache, gate_cache, block_table, memory, ks = create_state(num_seqs, max_num_blks, chunk_size, num_kv_heads, head_dim, dtype, zero=False, d_tile=d_tile)
@@ -979,6 +985,7 @@ def test_varlen_sementics(dtype: torch.dtype, num_kv_heads: int, query_per_kv_he
         chunk_size,
         d_tile,
         deg,
+        has_prefill,
     )
 
     # Run batch version
