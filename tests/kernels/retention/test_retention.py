@@ -11,7 +11,7 @@ from einops import rearrange, repeat
 from tests.kernels.utils import opcheck
 from vllm import _custom_ops as ops  # noqa: F401
 from vllm.attention.backends.utils import PAD_SLOT_ID
-from vllm.model_executor.layers.mamba.ops.retention import update_state, query_state, cumsum_intra_chunk_gate, update_intra_chunk_memory_and_cache_3d, cumsum_inter_chunk_memory
+from vllm.model_executor.layers.mamba.ops.retention import update_state, query_state, cumsum_intra_chunk_gate, update_intra_chunk_memory_and_cache_3d, cumsum_inter_chunk_memory, power_retention_varlen
 from vllm.platforms import current_platform
 
 
@@ -936,7 +936,7 @@ def test_query_state(dtype: torch.dtype, num_kv_heads: int, query_per_kv_heads: 
 @pytest.mark.parametrize("chunk_size", [32])
 @pytest.mark.parametrize("query_lens", [(1, 129),(32, 127)])
 @pytest.mark.parametrize("computed_lens", [(0, 0)])
-@pytest.mark.parametrize("d_tile", [16])
+@pytest.mark.parametrize("d_tile", [8])
 def test_varlen_sementics(dtype: torch.dtype, num_kv_heads: int, query_per_kv_heads: int, head_dim: int, chunk_size: int, query_lens: tuple[int, int], computed_lens: tuple[int, int], d_tile: int) -> None:
     if len(query_lens) != len(computed_lens):
         pytest.skip("query_lens and computed_lens must have the same length")
@@ -946,7 +946,6 @@ def test_varlen_sementics(dtype: torch.dtype, num_kv_heads: int, query_per_kv_he
     max_num_blks = (max([q + c for q, c in zip(query_lens, computed_lens)]) + chunk_size - 1) // chunk_size
     num_query_heads = num_kv_heads * query_per_kv_heads
     num_seqs = len(query_lens)
-    d_tile = 16
     deg = 2
     has_prefill = any(q > 1 for q in query_lens)
 
@@ -963,7 +962,7 @@ def test_varlen_sementics(dtype: torch.dtype, num_kv_heads: int, query_per_kv_he
     cu_seqlens_q_batch, cu_seqlens_padded_q_batch, cache_lens_batch, cu_cache_lens_batch, last_memorized_blk_idx_batch, seq_lens_batch = create_metadata(num_seqs, max_num_blks, chunk_size, query_lens, computed_lens)
     
     # Run ref
-    power_retention_varlen_ref(
+    power_retention_varlen(
         output,
         query,
         key,
@@ -1012,7 +1011,7 @@ def test_varlen_sementics(dtype: torch.dtype, num_kv_heads: int, query_per_kv_he
 
     output_batch = torch.cat(output_list, dim=0)
 
-    torch.testing.assert_close(output, output_batch, atol=5e-2, rtol=5e-3)
+    torch.testing.assert_close(output, output_batch, atol=1e-2, rtol=5e-3)
 
 
 def diff(a, b, if_abs: bool = True):
