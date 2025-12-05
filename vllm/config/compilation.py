@@ -502,6 +502,7 @@ class CompilationConfig:
         "vllm::gdn_attention_core",
         "vllm::kda_attention",
         "vllm::sparse_attn_indexer",
+        "vllm::retention",
     ]
 
     def compute_hash(self) -> str:

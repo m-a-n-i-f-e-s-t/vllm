@@ -251,6 +251,6 @@ def retention_fake(
 direct_register_custom_op(
     op_name="retention",
     op_func=retention,
-    mutates_args=["output"],
+    mutates_args=["output", "gate"],
     fake_impl=retention_fake,
 )
