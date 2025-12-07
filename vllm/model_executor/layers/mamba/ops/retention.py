@@ -333,7 +333,7 @@ def block_sympow_m_mma(
     phi_x = x1_x2.reshape(d_tile*d_tile, K) # [d_tile**2, K]
     if tile_idx_0 != tile_idx_1:
         phi_x *= 2
-    acc = tl.dot(phi_x, y, acc, allow_tf32=False) # [d_tile**2, N]
+    acc = tl.dot(phi_x.to(y.dtype), y, acc, allow_tf32=False) # [d_tile**2, N]
     l = l + tl.sum(phi_x, axis=1) # [d_tile**2]
     return acc, l
 
@@ -441,8 +441,8 @@ def discount_keys(
     deg: tl.constexpr, # int
 ):
     reversed_cum_log_gates = last_gate - cum_log_gates
-    discounted_x = x * (reversed_cum_log_gates / deg).exp()[None, :]
-    return discounted_x.to(x.dtype)
+    discounted_x = x.to(tl.float32) * (reversed_cum_log_gates / deg).exp()[None, :]
+    return discounted_x
 
 
 @triton.jit
@@ -717,6 +717,22 @@ def cumsum_inter_chunk_memory(
         gate_ptr = gate_ptr + this_schedule_len * gate_stride_0
         this_schedule_len = chunk_size
 
+@triton.jit
+def multiply(a, deg: tl.constexpr):
+    if deg == 1:
+        return a
+    elif deg == 2:
+        return a + a
+    elif deg == 4:
+        a = a + a
+        return a + a
+    elif deg == 8:
+        a = a + a
+        a = a + a
+        return a + a
+    else:
+        return deg * a
+
 # === Query State Kernels ===
 @triton.jit
 def attention_inner(
@@ -736,12 +752,8 @@ def attention_inner(
 ):
 
     # S : (BLOCK_M, TILE_SIZE)
-    S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
-
-    S += scale * tl.dot(Q.to(K.dtype), K, allow_tf32=False)
-
-    S = tl.log(S.abs() + 1e-7) * deg
-
+    S = tl.dot(Q, K, input_precision="ieee") * scale
+    S = multiply(tl.log(S.abs() + 1e-7), deg)
     S = S + GQ[:, None] - GK[None, :]
 
     S = tl.where(mask, S, float("-inf"))
@@ -771,7 +783,7 @@ def attention_inner(
     M = m_j
 
     # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-    acc += tl.dot(P.to(V.dtype), V, allow_tf32=False)
+    acc = tl.dot(P.to(V.dtype), V, acc, input_precision="ieee")
     return acc, L, M
     
 
@@ -932,6 +944,7 @@ def query_cache(
 
         acc, L, M = attention_inner(Q, K, V, GQ, GK, mask, acc, L, M, scale, BLOCK_M, TILE_SIZE, deg)
 
+    L = L + 1e-6
     return acc, L, M
 
 
@@ -942,7 +955,7 @@ def discount_query(
     deg: tl.constexpr, # int
 ):
     discounted_query = query * (cum_log_gates / deg).exp()[:, None]
-    return discounted_query.to(query.dtype)
+    return discounted_query
 
 
 @triton.jit
@@ -1289,7 +1302,7 @@ def query_state(
         # For decode, we only need to launch as many CTAs as there are queries, this reduces overhead massively
         total_q_blocks = num_seqs
 
-    TILE_SIZE = 16
+    TILE_SIZE = 32
     BLOCK_SIZE = chunk_size
 
     unified_query_state_2d[(total_q_blocks, num_kv_heads)](
