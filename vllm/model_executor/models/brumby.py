@@ -156,7 +156,7 @@ class BrumbyRetention(nn.Module):
         k = k_by_head.view(k.shape)
         q, k = self.rotary_emb(positions, q, k)
         g, _ = self.g_proj(hidden_states)
-        log_g = F.logsigmoid(g)
+        log_g = F.logsigmoid(g.to(torch.float32))
         attn_output = self.attn(q, k, v, log_g)
         output, _ = self.o_proj(attn_output)
         return output

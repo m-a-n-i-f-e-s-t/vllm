@@ -56,6 +56,7 @@ class Retention(MambaBase, CustomOp):
         config: PretrainedConfig | None = None,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
+        dtype: torch.dtype | None = None,
         prefix: str = "",
         layer_idx: int = 0,
     ):
@@ -70,8 +71,8 @@ class Retention(MambaBase, CustomOp):
         self.prefix = prefix
         self.layer_idx = layer_idx
         self.chunk_size = self.cache_config.mamba_block_size
-
-        self.d_tile = config.to_dict().get("d_tile", 16)
+        self.dtype = dtype or config.torch_dtype
+        self.d_tile = config.to_dict().get("d_tile", 8)
         self.power = config.to_dict().get("p", 2)
         self.state_dim = self.sympow_dim(self.head_dim, self.power, self.d_tile)
 
@@ -100,7 +101,7 @@ class Retention(MambaBase, CustomOp):
         assert self.config is not None
         assert self.cache_config is not None
         return MambaStateDtypeCalculator.retention_state_dtype(
-            self.config.torch_dtype,
+            self.dtype,
             self.cache_config.mamba_cache_dtype,
         )
 

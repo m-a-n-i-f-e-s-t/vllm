@@ -48,41 +48,28 @@ def find_combinadic_root(val, k: tl.constexpr):
 @triton.jit
 def get_sympow_coords_p2(linear_idx: tl.int32, N: tl.constexpr):
     """
-    Maps a linear index to coordinates in a symmetric power tensor.
-    Logic: Inverse Combinatorial Number System (Combinadics).
+    Maps a linear index to coordinates in a symmetric power tensor (non-increasing order)
     
     Args:
         linear_idx: The linearized index.
         N: The size of the dimension (e.g., 8).
     
     Returns:
-        tuple: (i_1, i_2, ... i_P) such that i_1 <= i_2 ...
+        tuple: (i_1, i_2, ... i_P) such that i_1 >= i_2 ...
     """
     P: tl.constexpr = 2
-    # 1. Calculate total elements: (N + P - 1) choose P
-    total = binom(N + P - 1, P)
-    
-    # 2. Invert index to switch to "growing" shape (Co-lexicographical)
-    rem = total - 1 - linear_idx
-    
-    # 3. Greedy decomposition
+    rem = linear_idx
     c1 = 0; c0 = 0
-    
+
     for d in tl.static_range(P, 0, -1):
-        # Find largest x such that binom(x, d) <= rem
         x = find_combinadic_root(rem, d)
         
         term = binom(x, d)
         rem = rem - term
         
-        # Convert back to real coordinate
-        real_coord = (N + d - 2) - x
-        
-        # Assign to specific variable based on d
-        if d == 2: c0 = real_coord
-        if d == 1: c1 = real_coord
+        if d == 2: c0 = x - 1
+        if d == 1: c1 = x
 
-    # Return ordered tuple (row, col, ...)
     return c0, c1
 
 
@@ -329,7 +316,7 @@ def block_sympow_m_mma(
     x2_range = tile_idx_1 * d_tile + d_tile_range
     x1 = slice_read_2d(x, 0, x1_range, dim, K, d_tile) # [d_tile, K]
     x2 = slice_read_2d(x, 0, x2_range, dim, K, d_tile) # [d_tile, K]
-    x1_x2 = x1[:, None, :] * x2[None, :, :] # [d_tile, d_tile, K]
+    x1_x2 = x1[None, :, :] * x2[:, None, :] # [d_tile, d_tile, K]
     phi_x = x1_x2.reshape(d_tile*d_tile, K) # [d_tile**2, K]
     if tile_idx_0 != tile_idx_1:
         phi_x *= 2
@@ -359,9 +346,9 @@ def block_sympow_k_mma(
     x2_range = tile_idx_1 * d_tile + d_tile_range
     x1 = slice_read_2d(x, 1, x1_range, M, dim, d_tile) # [M, d_tile]
     x2 = slice_read_2d(x, 1, x2_range, M, dim, d_tile) # [M, d_tile]
-    x1_x2 = x1[:, :, None] * x2[:, None, :] # [M, d_tile, d_tile]
+    x1_x2 = x1[:, None, :] * x2[:, :, None] # [M, d_tile, d_tile]
     phi_x = x1_x2.reshape(M, d_tile*d_tile) # [M, d_tile**2]
-    acc = tl.dot(phi_x.to(y.dtype), y, acc, allow_tf32=False) # [M, N]
+    acc = tl.dot(phi_x.to(y.dtype), y, allow_tf32=False) + acc # [M, N]
     l = tl.sum(phi_x * s[None, :], axis=1) + l # [M]
     return acc, l
 
@@ -416,21 +403,34 @@ def cumsum_intra_chunk_gate(
     else:
         last_cached_gate = 0.0
 
-    if query_len == 1: # just decoding
-        gate_ptrs = gate_ptr + query_start_idx * gate_stride_0 + head_idx * gate_stride_1
-        gate = tl.load(gate_ptrs)
-        tl.store(gate_ptrs, gate + last_cached_gate)
-        return
+    # This code path uses tl.cumsum, which is probably more efficient as it dispatches
+    # to a parallel scan operation, but it reduces precision.
 
-    gate_pos = tl.arange(0, chunk_size)
-    offset_gate = query_start_idx + local_query_start + gate_pos
-    mask_gate = gate_pos < local_query_len
+    # if query_len == 1: # just decoding
+    #     gate_ptrs = gate_ptr + query_start_idx * gate_stride_0 + head_idx * gate_stride_1
+    #     gate = tl.load(gate_ptrs)
+    #     tl.store(gate_ptrs, gate + last_cached_gate)
+    #     return
 
-    gate_ptrs = gate_ptr + offset_gate * gate_stride_0 + head_idx * gate_stride_1
-    gates = tl.load(gate_ptrs, mask=mask_gate, other=0) # [chunk_size]
-    gates = tl.cumsum(gates, axis=0) # [chunk_size]
-    gates = gates + last_cached_gate # [chunk_size]
-    tl.store(gate_ptrs, gates, mask=mask_gate)
+    # gate_pos = tl.arange(0, chunk_size)
+    # offset_gate = query_start_idx + local_query_start + gate_pos
+    # mask_gate = gate_pos < local_query_len
+
+    # gate_ptrs = gate_ptr + offset_gate * gate_stride_0 + head_idx * gate_stride_1
+    # gates = tl.load(gate_ptrs, mask=mask_gate, other=0) # [chunk_size]
+    # gates = tl.cumsum(gates, axis=0) # [chunk_size]
+    # gates = gates + last_cached_gate # [chunk_size]
+    # tl.store(gate_ptrs, gates, mask=mask_gate)
+
+    # This code path simply sequentially scan the gates, more accurate.
+    gate_ptr_i = gate_ptr + (query_start_idx + local_query_start) * gate_stride_0 + head_idx * gate_stride_1
+    gate_acc = last_cached_gate
+    for i in tl.static_range(chunk_size):
+        if i < local_query_len:
+            gate_acc = gate_acc + tl.load(gate_ptr_i)
+            tl.store(gate_ptr_i, gate_acc)
+            gate_ptr_i = gate_ptr_i + gate_stride_0
+
 
 
 @triton.jit
@@ -568,7 +568,7 @@ def update_intra_chunk_memory_and_cache_3d(
         range_s = tl.arange(0, BLOCK_S)
         memory_ptrs = memory_ptr + (state_block_idx * BLOCK_S + range_s[:, None]) * memory_stride_2 + range_dim[None, :] * memory_stride_3
         ks_ptrs = ks_ptr + (state_block_idx * BLOCK_S + range_s) * ks_stride_2
-        tl.store(memory_ptrs, acc)
+        tl.store(memory_ptrs, acc.to(memory_ptr.dtype.element_ty))
         tl.store(ks_ptrs, l)
 
     # otherwise just append the scheduled tokens to cache
@@ -1002,11 +1002,11 @@ def query_memory(
     Q = discount_query(Q, GQ, deg)
     state_offset = offs_s
     for dtile_0 in tl.range(0, HEAD_SIZE // d_tile):
-        for dtile_1 in tl.range(dtile_0, HEAD_SIZE // d_tile):
+        for dtile_1 in tl.range(0, dtile_0 + 1):
             memory = tl.load(memory_ptr + memory_block_idx * memory_stride_0 + kv_head_idx * memory_stride_1 + state_offset[:, None] * memory_stride_2 + offs_d[None, :] * memory_stride_3)
             ks = tl.load(ks_ptr + memory_block_idx * ks_stride_0 + kv_head_idx * ks_stride_1 + state_offset * ks_stride_2)
             acc, L = block_sympow_k_mma(Q, memory, ks, acc, L, BLOCK_M, HEAD_SIZE, deg, d_tile, dtile_0, dtile_1)
-            state_offset = state_offset + d_tile * d_tile
+            state_offset = state_offset + BLOCK_S
     acc = acc * scale_mem[:, None]
     L = L * scale_mem
     return acc, L
@@ -1042,7 +1042,7 @@ def unified_query_state_2d(
     cu_seqlens_q_ptr,  # [num_seqs+1]
     cu_seqlens_padded_q_ptr, # [num_seqs + 1]
     cache_lens_ptr, # [num_reqs]
-    scale: tl.float32,  # float32
+    scale: tl.constexpr,  # float32
     num_query_heads: tl.constexpr,  # int
     num_queries_per_kv: tl.constexpr,  # int
     BLOCK_SIZE: tl.constexpr,  # int

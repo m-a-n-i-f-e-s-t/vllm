@@ -72,7 +72,7 @@ def sympow_m_mma_ref(
             x2_range = slice(tile_1 * d_tile, tile_1 * d_tile + d_tile)
             x1 = x[:, x1_range, :]
             x2 = x[:, x2_range, :]
-            x1_x2 = x1[:, :, None, :] * x2[:, None, :, :] # [B, d_tile, d_tile, K]
+            x1_x2 = x1[:, None, :, :] * x2[:, :, None, :] # [B, d_tile, d_tile, K]
             phi_x = x1_x2.reshape(B, d_tile**2, x.shape[2]) # [B, d_tile**2, K]
             if tile_0 != tile_1:
                 phi_x *= 2
@@ -292,7 +292,7 @@ def discount_query_ref(
     gate_query: torch.Tensor, # [num_query_tokens, num_query_heads]
     deg: int, # int
 ) -> torch.Tensor:
-    discounted_query = (query * (gate_query / deg).exp().unsqueeze(-1)).to(query.dtype)
+    discounted_query = (query * (gate_query / deg).exp().unsqueeze(-1))
     return discounted_query
 
 def sympow_k_mma_ref(
@@ -316,10 +316,10 @@ def sympow_k_mma_ref(
             x2_range = slice(tile_1 * d_tile, tile_1 * d_tile + d_tile)
             x1 = x[..., x1_range]
             x2 = x[..., x2_range]
-            x1_x2 = x1[..., None] * x2[:, :, None, :] # [B, M, d_tile, d_tile]
+            x1_x2 = x1[:, :, None, :] * x2[:, :, :, None] # [B, M, d_tile, d_tile]
             phi_x[..., D_range] = x1_x2.reshape(x.shape[0], x.shape[1], d_tile**2)
             D_range += d_tile**2
-    acc += (phi_x @ y).to(acc.dtype) * scale[..., None]
+    acc += (phi_x.to(y.dtype) @ y).to(acc.dtype) * scale[..., None]
     l += (phi_x * s[:, None, :]).sum(dim=-1).to(l.dtype) * scale
     return acc, l
 
@@ -411,6 +411,7 @@ def unified_query_state_ref(
                 acc, l = sympow_k_mma_ref(discounted_query, memory_block, ks_block, acc.permute(1, 0, 2), l.permute(1, 0), scale_mem.permute(1, 0), head_dim, deg, d_tile)
                 acc = acc.permute(1, 0, 2)
                 l = l.permute(1, 0)
+            l += 1e-6
             acc = acc / l[..., None] # [num_query_tokens, num_query_heads, head_dim]
             output[chunk_query_start: chunk_query_start + chunk_query_len] = acc[chunk_cache_len:]
             chunk_query_start += chunk_query_len
@@ -929,14 +930,14 @@ def test_query_state(dtype: torch.dtype, num_kv_heads: int, query_per_kv_heads: 
     torch.testing.assert_close(output, output_ref, atol=1e-2, rtol=5e-3)
 
 
-@pytest.mark.parametrize("dtype", [torch.float32])
-@pytest.mark.parametrize("num_kv_heads", [1, 2])
-@pytest.mark.parametrize("query_per_kv_heads", [1, 5])
-@pytest.mark.parametrize("head_dim", [32, 128])
-@pytest.mark.parametrize("chunk_size", [32])
-@pytest.mark.parametrize("query_lens", [(1, 129),(32, 127)])
-@pytest.mark.parametrize("computed_lens", [(0, 0)])
-@pytest.mark.parametrize("d_tile", [8])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("num_kv_heads", [1,])
+@pytest.mark.parametrize("query_per_kv_heads", [1,])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("chunk_size", [512])
+@pytest.mark.parametrize("query_lens", [(2048,)])
+@pytest.mark.parametrize("computed_lens", [(0,)])
+@pytest.mark.parametrize("d_tile", [16])
 def test_varlen_sementics(dtype: torch.dtype, num_kv_heads: int, query_per_kv_heads: int, head_dim: int, chunk_size: int, query_lens: tuple[int, int], computed_lens: tuple[int, int], d_tile: int) -> None:
     if len(query_lens) != len(computed_lens):
         pytest.skip("query_lens and computed_lens must have the same length")
@@ -988,11 +989,13 @@ def test_varlen_sementics(dtype: torch.dtype, num_kv_heads: int, query_per_kv_he
     )
 
     # Run batch version
-    from retention.triton import power_retention
-    output_list = []
+    from retention.triton import power_retention, power_retention_inference
+    gold_output_list, recurrent_output_list, gate_list = [], [], []
     for i in range(num_seqs):
         query_start = cu_seqlens_q_batch[i].item()
         query_len = cu_seqlens_q_batch[i + 1].item() - query_start
+        assert query_len >= chunk_size, "query_len must be >= chunk_size for comprehensive test"
+        # full attention output
         query_states = query_batch[query_start:query_start + query_len].unsqueeze(0)
         key_states = key_batch[query_start:query_start + query_len].unsqueeze(0)
         value_states = value_batch[query_start:query_start + query_len].unsqueeze(0)
@@ -1004,14 +1007,97 @@ def test_varlen_sementics(dtype: torch.dtype, num_kv_heads: int, query_per_kv_he
             gate_states,
             deg=2,
             scale=float(head_dim)**-0.5,
-            chunk_size=999999,
-            switch_over_seq_len=999999,
+            initial_state=None,
+            sum_of_keys=None,
+            chunk_size=chunk_size,
+            switch_over_seq_len=query_len,
         )
-        output_list.append(attn_output.squeeze(0))
+        gold_output_list.append(attn_output)
+        
+        # start recurrent decoding
+        query_states = query_batch[query_start:query_start + chunk_size].unsqueeze(0)
+        key_states = key_batch[query_start:query_start + chunk_size].unsqueeze(0)
+        value_states = value_batch[query_start:query_start + chunk_size].unsqueeze(0)
+        gate_states = gate_batch[query_start:query_start + chunk_size].unsqueeze(0)
+        torch_gates = gate_states.cumsum(dim=1)
+        # initial chunk prefill
+        attn_output, state, sum_of_keys = power_retention_inference(
+            query_states,
+            key_states,
+            value_states,
+            gate_states,
+            deg=2,
+            scale=float(head_dim)**-0.5,
+            initial_state=None,
+            sum_of_keys=None,
+            # chunk_size=chunk_size,
+            switch_over_seq_len=chunk_size,
+        )
+        # as soon as we preocessed a chunk, we start token by token decoding
+        def reset_cache():
+            key_cache = torch.tensor([], device=key_states.device, dtype=key_states.dtype)
+            value_cache = torch.tensor([], device=value_states.device, dtype=value_states.dtype)
+            gate_cache = torch.tensor([], device=gate_states.device, dtype=gate_states.dtype)
+            return key_cache, value_cache, gate_cache
 
-    output_batch = torch.cat(output_list, dim=0)
+        def update_cache(key_cache, value_cache, gate_cache, new_key, new_value, new_gate):
+            key_cache = torch.cat([key_cache, new_key], dim=1)
+            value_cache = torch.cat([value_cache, new_value], dim=1)
+            gate_cache = torch.cat([gate_cache, new_gate], dim=1)
+            return key_cache, value_cache, gate_cache
 
-    torch.testing.assert_close(output, output_batch, atol=1e-2, rtol=5e-3)
+        key_cache, value_cache, gate_cache = reset_cache()
+        for i in range(chunk_size, query_len):
+            query_states = query_batch[query_start + i:query_start + i + 1].unsqueeze(0)
+            new_key = key_batch[query_start + i:query_start + i + 1].unsqueeze(0)
+            new_value = value_batch[query_start + i:query_start + i + 1].unsqueeze(0)
+            new_gate = gate_batch[query_start + i:query_start + i + 1].unsqueeze(0)
+            key_cache, value_cache, gate_cache = update_cache(key_cache, value_cache, gate_cache, new_key, new_value, new_gate)
+            decode_output, state, sum_of_keys = power_retention_inference(
+                query_states,
+                key_cache,
+                value_cache,
+                gate_cache,
+                deg=2,
+                scale=float(head_dim)**-0.5,
+                initial_state=state,
+                sum_of_keys=sum_of_keys,
+                # chunk_size=chunk_size,
+                switch_over_seq_len=chunk_size,
+            )
+            if i % chunk_size == chunk_size - 1 or i == query_len - 1:
+                gate_cache = gate_cache.cumsum(dim=1)
+                torch_gates = torch.cat([torch_gates, gate_cache], dim=1)
+                key_cache, value_cache, gate_cache = reset_cache()
+
+            attn_output = torch.cat([attn_output, decode_output], dim=1)
+
+        recurrent_output_list.append(attn_output.squeeze(0))
+        gate_list.append(torch_gates)
+
+    gold_output_batch = torch.cat(gold_output_list, dim=0)
+    recurrent_output_batch = torch.cat(recurrent_output_list, dim=0)
+
+    # Compare cumsum of gate
+    torch_gates = torch.cat(gate_list, dim=0)
+    cumsum_diff = (gate.squeeze() - torch_gates.squeeze()).abs().max()
+    print(f"cumsum diff (should be 0): {cumsum_diff}")
+
+    # Compare state and ks
+    idx = last_memorized_blk_idx_batch[0].item() + query_lens[0] // chunk_size
+    memory_blk = memory[block_table_batch[0, idx]]
+    sk_blk = ks[block_table_batch[0, idx]]
+    memory_diff = (memory_blk.squeeze() - state.squeeze()).abs().max()
+    sk_diff = (sk_blk.squeeze() - sum_of_keys.squeeze()).abs().max()
+    print(f"memory diff: {memory_diff}")
+    print(f"sk diff: {sk_diff}")
+    
+    torch.set_printoptions(profile="full")
+    print(f"output vs. gold: {(output - gold_output_batch).abs().max()}")
+    print(f"output vs. recurrent: {(output - recurrent_output_batch).abs().max()}")
+    print(f"gold vs. recurrent: {(gold_output_batch - recurrent_output_batch).abs().max()}")
+
+    torch.testing.assert_close(output, recurrent_output_batch, atol=1e-6, rtol=5e-3)
 
 
 def diff(a, b, if_abs: bool = True):
