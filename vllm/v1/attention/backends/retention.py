@@ -173,7 +173,7 @@ class RetentionMetadataBuilder(AttentionMetadataBuilder[RetentionMetadata]):
             if padded_num_reqs > num_reqs:
                 cache_lens[num_reqs:] = 0
                 cu_cache_lens[num_reqs + 1:] = cu_cache_lens[num_reqs]
-                last_memorized_blks[num_reqs:] = 0
+                last_memorized_blks[num_reqs:] = -1
                 stored_num_computed_tokens[num_reqs:] = 0
                 cu_seqlens_padded_q[num_reqs + 1:] = cu_seqlens_padded_q[num_reqs]
             
@@ -261,15 +261,10 @@ class RetentionMetadataBuilder(AttentionMetadataBuilder[RetentionMetadata]):
             self._cu_seqlens_q[:num_reqs + 1].copy_(
                 common_attn_metadata.query_start_loc, non_blocking=True
             )
-            # For padded requests, cu_seqlens_q should continue from last value
-            # Each padded request has 1 token (decode)
+            # For padded requests, cu_seqlens_q are all the same
             if padded_num_reqs > num_reqs:
-                # Use tensor operations instead of Python loop
                 last_val = self._cu_seqlens_q[num_reqs]
-                self._cu_seqlens_q[num_reqs + 1:padded_num_reqs + 1] = (
-                    last_val + torch.arange(1, padded_num_reqs - num_reqs + 1, 
-                                            device=self.device, dtype=torch.int32)
-                )
+                self._cu_seqlens_q[num_reqs + 1:padded_num_reqs + 1] = last_val  # Don't increment
             cu_seqlens_q = self._cu_seqlens_q[:padded_num_reqs + 1]
             
             # Handle block_table
