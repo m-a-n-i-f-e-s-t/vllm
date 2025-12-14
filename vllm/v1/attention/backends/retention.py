@@ -100,7 +100,6 @@ class RetentionMetadataBuilder(AttentionMetadataBuilder[RetentionMetadata]):
         common_attn_metadata: CommonAttentionMetadata, 
         mamba_block_size: int,
         use_cuda_graph_tensors: bool = False,
-        padded_num_reqs: int | None = None,
     ):
         device = common_attn_metadata.query_start_loc.device
         num_reqs = common_attn_metadata.num_reqs
@@ -110,40 +109,39 @@ class RetentionMetadataBuilder(AttentionMetadataBuilder[RetentionMetadata]):
         num_computed_tokens = self._num_computed_tokens[:num_reqs]
         
         if use_cuda_graph_tensors:
-            assert padded_num_reqs is not None
             # Use pre-allocated tensors for CUDA graph compatibility
             # Slice to padded size for consistent tensor shapes
-            cache_lens = self._cache_lens[:padded_num_reqs]
-            cu_cache_lens = self._cu_cache_lens[:padded_num_reqs + 1]
-            last_memorized_blks = self._last_memorized_blk_idx[:padded_num_reqs]
-            cu_seqlens_padded_q = self._cu_seqlens_padded_q[:padded_num_reqs + 1]
-            num_computed_tokens = self._num_computed_tokens[:padded_num_reqs]
+            cache_lens = self._cache_lens[:num_reqs]
+            cu_cache_lens = self._cu_cache_lens[:num_reqs + 1]
+            last_memorized_blks = self._last_memorized_blk_idx[:num_reqs]
+            cu_seqlens_padded_q = self._cu_seqlens_padded_q[:num_reqs + 1]
+            num_computed_tokens = self._num_computed_tokens[:num_reqs]
             
             # Compute values on the fly and copy into pre-allocated tensors
             # Make sure to match dtype (int32)
-            cache_lens[:num_reqs].copy_(
-                (num_computed_tokens[:num_reqs] % mamba_block_size).to(torch.int32), 
+            cache_lens.copy_(
+                (num_computed_tokens % mamba_block_size).to(torch.int32), 
                 non_blocking=True
             )
             cu_cache_lens[0] = 0
             cu_cache_lens[1:num_reqs + 1].copy_(
-                torch.cumsum(cache_lens[:num_reqs], dim=0), 
+                torch.cumsum(cache_lens, dim=0), 
                 non_blocking=True
             )
-            last_memorized_blks[:num_reqs].copy_(
-                (num_computed_tokens[:num_reqs] // mamba_block_size - 1).to(torch.int32), 
+            last_memorized_blks.copy_(
+                (num_computed_tokens // mamba_block_size - 1).to(torch.int32), 
                 non_blocking=True
             )
             
-            non_memorized_lens = cache_lens[:num_reqs] + query_len.to(torch.int32)
+            non_memorized_lens = cache_lens + query_len.to(torch.int32)
             padded_lens = ((non_memorized_lens + mamba_block_size - 1) // mamba_block_size) * mamba_block_size
             cu_seqlens_padded_q[0] = 0
-            cu_seqlens_padded_q[1:num_reqs + 1].copy_(
+            cu_seqlens_padded_q[1:].copy_(
                 torch.cumsum(padded_lens, dim=0), 
                 non_blocking=True
             )
 
-            if padded_num_reqs > num_reqs:
+            if self.max_num_seqs > num_reqs:
                 self._cache_lens[num_reqs:].fill_(0)
                 self._last_memorized_blk_idx[num_reqs:].fill_(-1)
                 self._cu_cache_lens[num_reqs + 1:].fill_(cu_cache_lens[num_reqs])
@@ -214,13 +212,11 @@ class RetentionMetadataBuilder(AttentionMetadataBuilder[RetentionMetadata]):
             and num_decodes <= self.max_cudagraph_capture_size
             and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
         ):
-            padded_num_reqs = self.vllm_config.pad_for_cudagraph(num_decodes)
             cache_lens, cu_cache_lens, last_memorized_blks, cu_seqlens_padded_q, num_computed_tokens = (
                 self.compute_prefix_caching_metadata(
                     common_attn_metadata, 
                     mamba_block_size,
                     use_cuda_graph_tensors=True,
-                    padded_num_reqs=padded_num_reqs,
                 )
             )
         else:
