@@ -680,7 +680,7 @@ def cumsum_inter_chunk_memory(
     cu_seqlens = tl.load(cu_seqlens_q_ptr + seq_idx)
     cu_seqlens_next = tl.load(cu_seqlens_q_ptr + seq_idx + 1)
     cur_query_len = cu_seqlens_next - cu_seqlens
-    if cur_query_len == 0: # padded sequence
+    if cur_query_len <= 0: # padded sequence
         return
     initial_memory_blk_seq_idx = tl.load(last_memorized_blk_idx_ptr + seq_idx)
     memory_ptr = memory_ptr + head_idx * memory_stride_1 + state_block_idx * BLOCK_S * memory_stride_2
@@ -989,12 +989,14 @@ def query_memory(
     ks_stride_2: tl.constexpr, # int
 ):
     # scale down attention output for numerical stability
-    alpha = tl.maximum(tl.sqrt(state_dim), tl.exp(M)) # [BLOCK_M]
-    scale_cache = tl.exp(M) / alpha # [BLOCK_M]
-    scale_mem = _power(scale, deg) / alpha # [BLOCK_M]
-    adj = scale_cache / scale_mem
-    acc = acc * adj[:, None]
-    L = L * adj
+    log_alpha = tl.maximum(tl.log(tl.sqrt(state_dim)), M) # [BLOCK_M]
+    scale_cache = tl.exp(M - log_alpha) # [BLOCK_M]
+    scale_mem = tl.exp(tl.log(_power(scale, deg)) - log_alpha) # [BLOCK_M]
+    # adj = scale_cache / scale_mem
+    # acc = acc * adj[:, None]
+    # L = L * adj
+    acc_mem = tl.zeros([BLOCK_M, HEAD_SIZE], dtype=tl.float32)
+    L_mem = tl.zeros([BLOCK_M], dtype=tl.float32)
     # query memory
     memory_block_idx = tl.load(block_table_ptr + seq_idx * block_table_stride_0 + last_memorized_blk_idx + chunk_idx).to(tl.int64)
     BLOCK_S: tl.constexpr = d_tile ** deg
@@ -1005,10 +1007,10 @@ def query_memory(
         for dtile_1 in tl.range(0, dtile_0 + 1):
             memory = tl.load(memory_ptr + memory_block_idx * memory_stride_0 + kv_head_idx * memory_stride_1 + state_offset[:, None] * memory_stride_2 + offs_d[None, :] * memory_stride_3)
             ks = tl.load(ks_ptr + memory_block_idx * ks_stride_0 + kv_head_idx * ks_stride_1 + state_offset * ks_stride_2)
-            acc, L = block_sympow_k_mma(Q, memory, ks, acc, L, BLOCK_M, HEAD_SIZE, deg, d_tile, dtile_0, dtile_1)
+            acc_mem, L_mem = block_sympow_k_mma(Q, memory, ks, acc_mem, L_mem, BLOCK_M, HEAD_SIZE, deg, d_tile, dtile_0, dtile_1)
             state_offset = state_offset + BLOCK_S
-    acc = acc * scale_mem[:, None]
-    L = L * scale_mem
+    acc = acc * scale_cache[:, None] + acc_mem * scale_mem[:, None]
+    L = L * scale_cache + L_mem * scale_mem
     return acc, L
 
 
@@ -1115,11 +1117,11 @@ def unified_query_state_2d(
         chunk_idx = 0
         local_block_idx = 0
         query_block_idx = 0
-        query_len = 1
         query_token_offset = tl.load(cu_seqlens_q_ptr + seq_idx)
+        query_len = tl.load(cu_seqlens_q_ptr + seq_idx + 1) - query_token_offset
         cache_len = tl.load(cache_lens_ptr + seq_idx)
         chunk_cache_len = cache_len
-        block_scheduled_len = 1
+        block_scheduled_len = query_len
 
 
     # skip if there's no scheduled tokens in this block, could be due to:
@@ -1350,7 +1352,6 @@ def query_state(
     )
 
 
-
 def update_state(
     key: torch.Tensor, # [num_tokens, num_kv_heads, head_dim]
     value: torch.Tensor, # [num_tokens, num_kv_heads, head_dim]
@@ -1371,16 +1372,22 @@ def update_state(
     deg: int, # int
 ):
     # Most of the kernels in update_state are parallelized over chunks.
-    # Here we want to launch \sum_i(cdiv(query_len[i], chunk_size)) kernels
-    # but materializing cu_seqlens_q on cpu is slow, so we take its uppper bound
+    # We want to launch \sum_i(cdiv(query_len[i] + cache_lens[i], chunk_size)) 
+    # kernels along sequence dimension. To avoid materialization on cpu, we take
+    # its upper bound: 
+    #  \sum_i(cdiv(query_len[i] + cache_lens[i], chunk_size)) 
+    #  <= \sum_i(cdiv(query_len[i] + chunk_size, chunk_size)) 
+    #  = \sum_i(cdiv(query_len[i], chunk_size)) + \sum_i(1)
+    #  <= num_tokens // chunk_size + num_seqs + num_seqs
+    #  = num_tokens // chunk_size + 2 * num_seqs
     num_seqs = seq_lens.shape[0]
     num_tokens = key.shape[0]
-    total_chunks = num_tokens // chunk_size + num_seqs
+    total_chunks_including_cache = num_tokens // chunk_size + 2 * num_seqs
     num_kv_heads, head_dim = key.shape[1], key.shape[2]
     state_dim = memory.shape[2]
 
     # First gating needs to be cumsummed intra-chunk in-place
-    cumsum_intra_chunk_gate[(total_chunks, num_kv_heads)](
+    cumsum_intra_chunk_gate[(total_chunks_including_cache, num_kv_heads)](
         gate,
         gate_cache,
         block_table,
@@ -1396,15 +1403,6 @@ def update_state(
     )
 
     # Then perform intra-chunk memory updates and cache updates.
-    # We want to launch \sum_i(cdiv(query_len[i] + cache_lens[i], chunk_size)) 
-    # kernels along sequence dimension. To avoid materialization on cpu, we take
-    # its upper bound: 
-    #  \sum_i(cdiv(query_len[i] + cache_lens[i], chunk_size)) 
-    #  <= \sum_i(cdiv(query_len[i] + chunk_size, chunk_size)) 
-    #  = \sum_i(cdiv(query_len[i], chunk_size)) + \sum_i(1)
-    #  <= num_tokens // chunk_size + num_seqs + num_seqs
-    #  = num_tokens // chunk_size + 2 * num_seqs
-    total_chunks_including_cache = num_tokens // chunk_size + 2 * num_seqs
     BLOCK_S = d_tile ** deg
     num_state_blocks = state_dim // BLOCK_S
     BLOCK_T = 16
