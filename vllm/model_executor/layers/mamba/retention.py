@@ -72,8 +72,11 @@ class Retention(MambaBase, CustomOp):
         self.layer_idx = layer_idx
         self.chunk_size = self.cache_config.mamba_block_size
         self.dtype = dtype or config.torch_dtype
-        self.d_tile = config.to_dict().get("d_tile", 8)
         self.power = config.to_dict().get("p", 2)
+        d_tile = config.to_dict().get("d_tile", 8)
+        if self.power >= 3:
+            d_tile = 8 # for p>=3, chunked algo becomes infeasible, we use d_tile=8 to support attention kernel
+        self.d_tile = d_tile
         self.state_dim = self.sympow_dim(self.head_dim, self.power, self.d_tile)
 
         compilation_config = get_current_vllm_config().compilation_config
@@ -109,7 +112,8 @@ class Retention(MambaBase, CustomOp):
         return MambaStateShapeCalculator.retention_state_shape(
             num_heads=self.num_kv_heads,
             head_dim=self.head_dim,
-            state_dim=self.state_dim,
+            # we use a fake state dimension for power > 2 to support attention kernel
+            state_dim=self.state_dim if self.power == 2 else self.d_tile,
             chunk_size=self.chunk_size,
         )
 

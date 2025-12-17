@@ -216,7 +216,6 @@ def localize_d_tile_idxs(
     dim: tl.constexpr, # int
     power: tl.constexpr, # int
 ):
-    tl.static_assert(power == 2, "power must be 2")
     idx0, idx1 = get_sympow_coords_p2(state_block_idx, dim)
     return idx0, idx1
 
@@ -309,7 +308,6 @@ def block_sympow_m_mma(
     tile_idx_1: tl.int32, # int
 ):
     tl.static_assert(dim % d_tile == 0, "dim must be divisible by d_tile")
-    tl.static_assert(power == 2, "power must be 2")
     d_tile_range = tl.arange(0, d_tile)
 
     x1_range = tile_idx_0 * d_tile + d_tile_range
@@ -339,7 +337,6 @@ def block_sympow_k_mma(
     tile_idx_0: tl.int32, # int
     tile_idx_1: tl.int32 # int
 ):
-    tl.static_assert(power == 2, "power must be 2")
     tl.static_assert(dim % d_tile == 0, "dim must be divisible by d_tile")
     d_tile_range = tl.arange(0, d_tile)
     x1_range = tile_idx_0 * d_tile + d_tile_range
@@ -425,7 +422,7 @@ def cumsum_intra_chunk_gate(
     # This code path simply sequentially scan the gates, more accurate.
     gate_ptr_i = gate_ptr + (query_start_idx + local_query_start) * gate_stride_0 + head_idx * gate_stride_1
     gate_acc = last_cached_gate
-    for i in tl.static_range(chunk_size):
+    for i in tl.range(chunk_size):
         if i < local_query_len:
             gate_acc = gate_acc + tl.load(gate_ptr_i)
             tl.store(gate_ptr_i, gate_acc)
@@ -999,7 +996,7 @@ def query_memory(
     L_mem = tl.zeros([BLOCK_M], dtype=tl.float32)
     # query memory
     memory_block_idx = tl.load(block_table_ptr + seq_idx * block_table_stride_0 + last_memorized_blk_idx + chunk_idx).to(tl.int64)
-    BLOCK_S: tl.constexpr = d_tile ** deg
+    BLOCK_S: tl.constexpr = d_tile ** 2 # force p2 so that it compiles for p3 and p4, but p3 and p4 won't trigger this path
     offs_s = tl.arange(0, BLOCK_S)
     Q = discount_query(Q, GQ, deg)
     state_offset = offs_s
@@ -1403,8 +1400,8 @@ def update_state(
     )
 
     # Then perform intra-chunk memory updates and cache updates.
-    BLOCK_S = d_tile ** deg
-    num_state_blocks = state_dim // BLOCK_S
+    BLOCK_S = d_tile ** 2 # force p2 so that it compiles for p3 and p4, but p3 and p4 won't trigger this path
+    num_state_blocks = (state_dim // BLOCK_S) or 1 # state_dim is fake for p>=3
     BLOCK_T = 16
     update_intra_chunk_memory_and_cache_3d[(total_chunks_including_cache, num_kv_heads, num_state_blocks)](
         key,
@@ -1423,7 +1420,7 @@ def update_state(
         num_seqs,
         head_dim,
         d_tile,
-        deg,
+        2,
         BLOCK_T,
         *key.stride(),
         *value.stride(),
@@ -1438,6 +1435,8 @@ def update_state(
 
     # Then perform inter-chunk memory cumsum. This might be inefficient if one sequence
     # is much longer than the rest. Can be improved with associative scan.
+    if deg > 2:
+        return
     cumsum_inter_chunk_memory[(num_seqs, num_kv_heads, num_state_blocks)](
         memory,
         ks,

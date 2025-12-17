@@ -182,6 +182,7 @@ class BrumbyConfig(PretrainedConfig):
         switch_over_seq_len=8192,
         prefill_chunk_size=1024,
         use_exp=False,
+        p=2,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -227,7 +228,7 @@ class BrumbyConfig(PretrainedConfig):
         self.switch_over_seq_len = switch_over_seq_len
         self.prefill_chunk_size = prefill_chunk_size
         self.use_exp = use_exp
-        self.p = 2 # power of expansion for power attention, only 2 is supported for now
+        self.p = p
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
